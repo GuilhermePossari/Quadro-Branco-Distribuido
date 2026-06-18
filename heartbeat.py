@@ -4,7 +4,9 @@ heartbeat.py — Heartbeat em anel para o SDWB
 Como funciona:
   - O anel é uma lista ordenada de nós: [coord, clienteA, clienteB, ...]
   - Cada nó pinga o próximo no anel a cada T segundos
-  - Se não houver resposta em 2T, o vizinho é declarado morto
+  - Cada ping tem timeout de 2T; um ping perdido conta como um "strike"
+  - Só após max_falhas pings perdidos consecutivos o vizinho é declarado morto
+    (evita falsos positivos por blip de rede / coordenador ocupado)
   - Se o morto era o coordenador → dispara eleição (on_coordenador_falhou)
   - Se era um cliente comum     → notifica o coordenador (on_membro_falhou)
 
@@ -65,11 +67,17 @@ class Heartbeat:
     Instanciar um por processo (cliente ou coordenador).
     """
 
-    def __init__(self, own_ip: str, own_port: int, intervalo: float = 2.0):
+    def __init__(self, own_ip: str, own_port: int, intervalo: float = 2.0,
+                 max_falhas: int = 3):
         self.own_ip    = own_ip
         self.own_port  = own_port
         self.own_id    = f"{own_ip}:{own_port}"
         self.intervalo = intervalo          # T — segundos entre pings
+
+        # Nº de pings perdidos consecutivos antes de declarar o vizinho morto.
+        # Evita falsos positivos (blip de rede, GC, coord ocupado em broadcast)
+        # que disparariam eleições espúrias com um único ping perdido.
+        self.max_falhas = max_falhas
 
         self._ring: list  = []             # anel atual
         self._coord_id    = ""             # "ip:porta" do coordenador
@@ -77,6 +85,11 @@ class Heartbeat:
         self._running     = False
         self._thread      = None
         self._send        = None           # injetado em iniciar()
+
+        # Contador de strikes do vizinho atualmente monitorado.
+        # Só é tocado pela thread do loop (_checar_vizinho), não precisa de lock.
+        self._vizinho_monitorado = None    # "ip:porta" a que o contador se refere
+        self._falhas_consecutivas = 0
 
         # ── Callbacks — defina antes de chamar iniciar() ──────────────
         self.on_membro_falhou: callable      = None   # fn(ip: str, port: int)
@@ -110,7 +123,7 @@ class Heartbeat:
         )
         self._thread.start()
         print(f"[HB {self.own_id}] Iniciado — {len(ring)} nó(s) no anel, "
-              f"intervalo={self.intervalo}s")
+              f"intervalo={self.intervalo}s, max_falhas={self.max_falhas}")
 
     def parar(self):
         """Para o heartbeat (usado quando o nó sai voluntariamente)."""
@@ -152,7 +165,18 @@ class Heartbeat:
     def _checar_vizinho(self):
         vizinho = self._proximo_vizinho()
         if vizinho is None:
-            return   # anel com ≤ 1 nó — nada a pingar
+            # Anel com ≤ 1 nó — nada a pingar. Zera o contador.
+            self._vizinho_monitorado = None
+            self._falhas_consecutivas = 0
+            return
+
+        vz_id = f"{vizinho['ip']}:{vizinho['port']}"
+
+        # Se o vizinho mudou (entrada/saída de nó, RING_UPDATE), recomeça a
+        # contagem — strikes só fazem sentido contra um mesmo alvo.
+        if vz_id != self._vizinho_monitorado:
+            self._vizinho_monitorado = vz_id
+            self._falhas_consecutivas = 0
 
         resp = self._send(
             vizinho["ip"],
@@ -161,9 +185,20 @@ class Heartbeat:
             timeout=self.intervalo * 2,   # tolerância de 2T
         )
 
-        if resp is None or resp.get("type") != protocol.HEARTBEAT_OK:
-            vz_id = f"{vizinho['ip']}:{vizinho['port']}"
-            print(f"[HB {self.own_id}] Vizinho {vz_id} não respondeu — falha!")
+        if resp is not None and resp.get("type") == protocol.HEARTBEAT_OK:
+            # Respondeu — zera os strikes acumulados.
+            self._falhas_consecutivas = 0
+            return
+
+        # Ping perdido — acumula strike.
+        self._falhas_consecutivas += 1
+        print(f"[HB {self.own_id}] Vizinho {vz_id} não respondeu "
+              f"({self._falhas_consecutivas}/{self.max_falhas}).")
+
+        if self._falhas_consecutivas >= self.max_falhas:
+            print(f"[HB {self.own_id}] Vizinho {vz_id} excedeu o limite — falha confirmada!")
+            self._vizinho_monitorado = None
+            self._falhas_consecutivas = 0
             self._tratar_falha(vizinho)
 
     # ------------------------------------------------------------------

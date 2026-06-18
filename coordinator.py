@@ -301,8 +301,14 @@ class Coordinator(Node):
         return [m for m in self._members if not (m["ip"] == ip and m["port"] == porta)]
 
     def _broadcast(self, msg: dict, membros: list):
-        """Envia msg para todos os membros em paralelo. Fire-and-forget."""
+        """
+        Envia msg para todos os membros em paralelo. Fire-and-forget.
+        Nunca envia para o PRÓPRIO endereço: no Design B o nó coordenador também
+        está em _members, e enviar a si mesmo causaria reprocessamento em loop.
+        """
         def _enviar(m):
+            if m["ip"] == self.host and m["port"] == self.port:
+                return
             self.send_sem_resposta(m["ip"], m["port"], msg)
 
         for m in membros:

@@ -28,6 +28,58 @@ _lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Poda de quadros órfãos (verificação de vivacidade no LIST)
+# ---------------------------------------------------------------------------
+# O SN não é avisado quando um coordenador CRASHA (kill -9) nem quando um handoff
+# de saída falha: a entrada ficaria na tabela apontando para um nó morto — aparece
+# no LIST, mas o JOIN falha ("coordenador não disponível"). Para evitar esses
+# quadros "fantasma", antes de responder o LIST o SN faz um probe rápido em cada
+# coordenador (conecta + HEARTBEAT) e remove da tabela os que não respondem.
+
+def _coordenador_vivo(ip: str, port: int, timeout: float = 1.0) -> bool:
+    """True se o coordenador em ip:port responde a um HEARTBEAT dentro do timeout."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        s.sendall(protocol.encode(protocol.make_heartbeat("name_service")))
+        resp = protocol.decode(s)
+        return resp is not None and resp.get("type") == protocol.HEARTBEAT_OK
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _separar_vivos_e_mortos(itens: list):
+    """
+    Faz probe EM PARALELO de cada (nome, {ip, port}) — para não somar timeouts —
+    e separa vivos de mortos.
+    Retorna (vivos: [(nome, dados)], mortos: [(nome, ip, port)]).
+    """
+    resultado = {}
+
+    def _probe(nome, ip, port):
+        resultado[nome] = _coordenador_vivo(ip, port)
+
+    threads = [
+        threading.Thread(target=_probe, args=(n, d["ip"], d["port"]), daemon=True)
+        for n, d in itens
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2.0)
+
+    vivos  = [(n, d) for n, d in itens if resultado.get(n)]
+    mortos = [(n, d["ip"], d["port"]) for n, d in itens if not resultado.get(n)]
+    return vivos, mortos
+
+
+# ---------------------------------------------------------------------------
 # Lógica de cada conexão
 # ---------------------------------------------------------------------------
 
@@ -61,10 +113,22 @@ def _tratar_cliente(conn: socket.socket, addr: tuple):
         # --- LIST: cliente pede a lista de quadros disponíveis ---
         elif tipo == protocol.LIST:
             with _lock:
-                lista = [
-                    {"name": nome, "ip": dados["ip"], "port": dados["port"]}
-                    for nome, dados in _quadros.items()
-                ]
+                itens = list(_quadros.items())
+            vivos, mortos = _separar_vivos_e_mortos(itens)
+            # Poda os órfãos — mas só apaga se a entrada ainda apontar para o mesmo
+            # endereço morto que foi sondado (evita remover um quadro que acabou de
+            # ser RE-registrado, ex.: novo coordenador após eleição).
+            if mortos:
+                with _lock:
+                    for nome, ip, port in mortos:
+                        atual = _quadros.get(nome)
+                        if atual and atual["ip"] == ip and atual["port"] == port:
+                            _quadros.pop(nome, None)
+                            print(f"[SN] Podado (coordenador não responde): '{nome}' -> {ip}:{port}")
+            lista = [
+                {"name": nome, "ip": dados["ip"], "port": dados["port"]}
+                for nome, dados in vivos
+            ]
             conn.sendall(protocol.encode(protocol.make_list_response(lista)))
 
         else:

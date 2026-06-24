@@ -156,6 +156,33 @@ quem caiu — por isso ela é descentralizada (anel).
   `sair_do_quadro()`/`_resetar_para_lobby()` em `client.py` e o multiplexador de
   sessões na `App` (`telas.py`). Coberto por `scripts/teste_multiquadro.py`.
 
+### 2.11. Quadros órfãos no SN — poda no LIST + handoff confirmado
+- **Problema observado:** um quadro pode ficar **registrado no SN apontando para um
+  coordenador que não existe mais** → aparece no `LIST` mas o `JOIN` falha
+  ("coordenador não disponível"). Duas origens:
+  1. **Handoff cego na saída:** o `sair()` (caso 2) escolhia o sucessor de maior
+     `ip:porta` e mandava `COORDINATOR` em *fire-and-forget*, **sem confirmar** se ele
+     estava vivo, e parava **sem desregistrar**. Ao fechar o app inteiro (várias
+     sessões saindo juntas, §2.10), o coordenador de fundo fazia handoff para um irmão
+     que também estava caindo → ninguém assumia e o quadro ficava órfão no SN.
+  2. **Crash do coordenador** (kill -9): nenhum caminho gracioso roda, a entrada fica.
+- **Fix A — SN poda no `LIST` (`name_service.py`).** Antes de responder o `LIST`, o SN
+  faz um *probe* rápido em paralelo de cada coordenador (`connect` + `HEARTBEAT`,
+  timeout ~1s) e **remove os que não respondem**. Garante que a lista só mostra quadros
+  realmente ingressáveis, cobrindo **todas** as origens (inclusive crash). A remoção é
+  condicional ao endereço sondado ainda ser o registrado (não apaga um quadro
+  RE-registrado nesse meio-tempo, ex.: novo coordenador após eleição).
+  - ⚠️ **Decisão consciente:** isso torna o SN **levemente ativo** (ele agora conecta nos
+    coordenadores), enquanto antes era puramente passivo (§2 dizia "só a tabela"). A
+    tabela em si continua só `(nome, ip, porta)`; o probe é volátil, não é estado novo.
+- **Fix B — handoff confirmado (`client.py::sair`).** No caso 2, tenta os sucessores do
+  maior para o menor `ip:porta`; só considera transferido se o sucessor **responder**
+  (`self.send` espera o `OK` de `Election.tratar_coordinator`). Se **nenhum** sucessor
+  vivo responder, **desregistra o quadro** (`UNREGISTER`) em vez de deixá-lo órfão.
+- **Por que os dois:** o B corrige na origem (saída graciosa não orfana); o A é a defesa
+  robusta que limpa qualquer órfão remanescente (handoff perdido, crash). Coberto por
+  `scripts/teste_orfaos.py`.
+
 ---
 
 ## 3. Protocolo de mensagens

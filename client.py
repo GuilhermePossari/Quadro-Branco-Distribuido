@@ -200,10 +200,33 @@ class Client(Node):
             self.stop()
             return
 
-        # Caso 2 — handoff: sucessor = maior (ip,porta), igual ao critério do Bully
-        sucessor = max(outros, key=lambda m: (m["ip"], m["port"]))
+        # Caso 2 — handoff CONFIRMADO: tenta os sucessores do maior (ip,porta) para
+        # o menor (mesmo critério do Bully). Só considera transferido se o sucessor
+        # RESPONDER (self.send espera o OK de Election.tratar_coordinator). Se NENHUM
+        # sucessor vivo responder, NÃO orfana o quadro: desregistra do SN. Isso evita
+        # o "quadro fantasma" quando o sucessor escolhido também está caindo (ex.:
+        # fechar o app inteiro, com várias sessões saindo juntas) ou já morreu.
+        candidatos = sorted(outros, key=lambda m: (m["ip"], m["port"]), reverse=True)
+        sucessor = None
+        for c in candidatos:
+            resp = self.send(c["ip"], c["port"],
+                             protocol.make_coordinator(c["ip"], c["port"]), timeout=2)
+            if resp is not None and resp.get("type") == protocol.OK:
+                sucessor = c
+                break
+
+        if sucessor is None:
+            # Ninguém vivo para assumir → desregistra (em vez de deixar órfão no SN).
+            self.send_sem_resposta(self.ns_host, self.ns_port,
+                                   protocol.make_unregister(self.board_name))
+            self.stop()
+            return
+
+        # Avisa os DEMAIS membros para atualizarem a referência ao novo coordenador.
         anuncio = protocol.make_coordinator(sucessor["ip"], sucessor["port"])
         for m in outros:
+            if m["ip"] == sucessor["ip"] and m["port"] == sucessor["port"]:
+                continue
             self.send_sem_resposta(m["ip"], m["port"], anuncio)
         self.stop()
 

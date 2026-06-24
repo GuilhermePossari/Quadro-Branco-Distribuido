@@ -16,19 +16,36 @@ Estrutura:
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 
+from client import Client, porta_livre
+
 # Duas cores disponíveis (enunciado §1.1)
-COR_A = "#d62728"   # vermelho
-COR_B = "#1f77b4"   # azul
+COR_A = "#8b4513"   # marrom
+COR_B = "#2ca02c"   # verde
 COR_PADRAO = "#000000"
 
 
 class App(tk.Tk):
-    """Janela raiz e controlador de telas. Recebe um Client já instanciado."""
+    """
+    Janela raiz e controlador de telas. Recebe um Client já instanciado, que passa
+    a ser a sessão de PRIMEIRO PLANO (a que a tela atual reflete).
+
+    Suporte a MÚLTIPLOS quadros: quando o nó é coordenador e usa "Sair do quadro",
+    ele NÃO abre mão do papel — aquela sessão é movida para SEGUNDO PLANO (continua
+    hospedando) e uma nova sessão (nova porta) assume o primeiro plano. Assim este
+    processo pode coordenar vários quadros ao mesmo tempo. O papel só é cedido a
+    outro nó quando o programa fecha (cada sessão faz sair() → handoff/eleição).
+    """
 
     def __init__(self, client):
         super().__init__()
-        self.client = client
-        client.master = self          # _ui() passa a enfileirar para esta janela
+        self.client = client          # sessão de PRIMEIRO PLANO (reflete a tela atual)
+        self._fundo = []              # sessões em SEGUNDO PLANO: quadros que este
+                                      # processo continua hospedando como coordenador
+        # Dados para abrir novas sessões (novos quadros) sem largar as antigas:
+        self._host    = client.host
+        self._ns_host = client.ns_host
+        self._ns_port = client.ns_port
+
         self.title(f"SDWB — {client.node_id}")
         self.geometry("900x650")
 
@@ -36,8 +53,21 @@ class App(tk.Tk):
         self._container.pack(fill="both", expand=True)
         self._tela_atual = None
 
-        # Liga os callbacks de rede aos métodos da tela do quadro.
-        # (definidos aqui no controlador; redirecionam para a TelaQuadro ativa)
+        self._wire(client)            # liga os callbacks de rede a esta sessão
+        self.protocol("WM_DELETE_WINDOW", self._ao_fechar)
+        self.mostrar(TelaInicial)
+        self._poll_ui()               # drena callbacks de rede na thread do tkinter
+
+    def _poll_ui(self):
+        """Consome a fila de callbacks da sessão de primeiro plano (D4).
+        Sessões de segundo plano têm callbacks desligados (não enfileiram nada)."""
+        self.client.drenar_ui()
+        self.after(40, self._poll_ui)
+
+    # ── Sessões (1 por quadro) ────────────────────────────────────────
+    def _wire(self, client):
+        """Liga os callbacks de rede desta sessão à GUI (ela vira o primeiro plano)."""
+        client.master = self          # _ui() passa a enfileirar para esta janela
         client.on_state_loaded  = self._cb_state_loaded
         client.on_draw          = self._cb_draw
         client.on_remove        = self._cb_remove
@@ -45,14 +75,59 @@ class App(tk.Tk):
         client.on_error         = self._cb_error
         client.on_coord_changed = self._cb_coord_changed
 
-        self.protocol("WM_DELETE_WINDOW", self._ao_fechar)
-        self.mostrar(TelaInicial)
-        self._poll_ui()               # drena callbacks de rede na thread do tkinter
+    def _unwire(self, client):
+        """Desliga os callbacks: a sessão vai para segundo plano — continua
+        mantendo seu estado interno (self.objetos) e servindo o quadro pela rede,
+        mas não toca mais a tela."""
+        client.on_state_loaded  = None
+        client.on_draw          = None
+        client.on_remove        = None
+        client.on_color         = None
+        client.on_error         = None
+        client.on_coord_changed = None
 
-    def _poll_ui(self):
-        """Consome a fila de callbacks do Client (thread-safety da GUI, D4)."""
-        self.client.drenar_ui()
-        self.after(40, self._poll_ui)
+    def _nova_sessao(self):
+        """Abre uma nova sessão de primeiro plano (servidor numa porta livre) em
+        estado de lobby, para criar/ingressar em outro quadro sem largar os atuais."""
+        cli = Client(self._host, porta_livre(self._host),
+                     self._ns_host, self._ns_port, master=self)
+        self._wire(cli)
+        cli.start()
+        return cli
+
+    def sair_do_quadro_atual(self):
+        """
+        Handler do botão "Sair do quadro" da TelaQuadro. Delega ao Client a regra:
+        cliente comum sai de fato; coordenador continua hospedando em segundo plano.
+        """
+        cli = self.client
+        era_coordenador = cli.sou_coordenador
+        nome_quadro = cli.board_name
+
+        # Sair encerra a seleção atual → libera a trava do objeto (evita trava
+        # órfã quando o coordenador segue hospedando em segundo plano).
+        q = self._quadro()
+        if q is not None and q.selecionado:
+            cli.desselecionar(q.selecionado)
+            q.selecionado = None
+
+        if cli.sair_do_quadro():
+            # Cliente comum / lobby: saiu de fato; reaproveita a mesma sessão.
+            self.mostrar(TelaInicial)
+            return
+
+        # Coordenador: mantém hospedando o quadro em segundo plano e abre uma
+        # nova sessão (nova porta) para o primeiro plano.
+        self._unwire(cli)
+        self._fundo.append(cli)
+        self.client = self._nova_sessao()
+        self.mostrar(TelaInicial)
+        if era_coordenador:
+            messagebox.showinfo(
+                "Quadro mantido",
+                f"Você é o coordenador de '{nome_quadro}'.\n\n"
+                f"O quadro continuará hospedado por este nó em segundo plano "
+                f"({cli.node_id}) até você fechar o programa.")
 
     # ── Troca de telas ────────────────────────────────────────────────
     def mostrar(self, classe_tela, **kwargs):
@@ -91,10 +166,14 @@ class App(tk.Tk):
 
     # ── Encerramento gracioso ─────────────────────────────────────────
     def _ao_fechar(self):
-        try:
-            self.client.sair()       # LEAVE / handoff / encerra quadro (D6)
-        except Exception:
-            pass
+        # Fechar o programa é o ÚNICO momento em que abrimos mão do papel de
+        # coordenador: cada sessão (primeiro plano + as hospedadas em segundo
+        # plano) faz sua saída graciosa — LEAVE / handoff / encerra quadro (D6).
+        for cli in [self.client, *self._fundo]:
+            try:
+                cli.sair()
+            except Exception:
+                pass
         self.destroy()
 
 
@@ -114,6 +193,12 @@ class TelaInicial(tk.Frame):
                   command=self._criar).pack(pady=8)
         tk.Button(self, text="INGRESSAR EM QUADRO EXISTENTE", width=28, height=2,
                   command=self._ingressar).pack(pady=8)
+
+        hospedados = [c.board_name for c in app._fundo
+                      if c.sou_coordenador and c.board_name]
+        if hospedados:
+            tk.Label(self, text="Hospedando em segundo plano: " + ", ".join(hospedados),
+                     font=("Arial", 10), fg="#2a8f4f").pack(pady=(35, 0))
 
     def _criar(self):
         nome = simpledialog.askstring("Criar quadro", "Nome do novo quadro:", parent=self)
@@ -213,6 +298,11 @@ class TelaQuadro(tk.Frame):
 
         tk.Button(tb, text="Remover", width=8, command=self._remover).pack(side="left", padx=12)
 
+        # Volta para a tela inicial. Se este nó for coordenador, o quadro continua
+        # hospedado em segundo plano (a App trata isso em sair_do_quadro_atual).
+        tk.Button(tb, text="Sair do quadro", width=13,
+                  command=self.app.sair_do_quadro_atual).pack(side="right", padx=8, pady=4)
+
     def _montar_canvas(self):
         self.canvas = tk.Canvas(self, bg="white", cursor="cross")
         self.canvas.pack(fill="both", expand=True)
@@ -232,8 +322,13 @@ class TelaQuadro(tk.Frame):
 
     # ── Toolbar handlers ──────────────────────────────────────────────
     def _set_ferramenta(self, f):
+        # Mudar de ferramenta encerra a seleção atual → libera a trava do objeto.
+        if self.selecionado is not None:
+            self.client.desselecionar(self.selecionado)
+            self.selecionado = None
         self.ferramenta = f
         self.pontos_temp = []
+        self._redesenhar()
         self._atualizar_status()
 
     def _set_cor(self, cor):
@@ -270,17 +365,42 @@ class TelaQuadro(tk.Frame):
             self.client.desenhar(obj)   # atualiza réplica + broadcast; eco volta via _aplicar_na_gui
 
     def _selecionar_em(self, x, y):
+        """
+        Seleção com exclusão mútua (enunciado §3A): selecionar um objeto adquire
+        sua trava no coordenador. Se outro nó já o selecionou, a trava é negada e
+        este nó recebe uma mensagem de erro (não consegue selecionar).
+        """
+        alvo = self._obj_em(x, y)
+
+        # Clicar de novo no mesmo objeto: nada muda (continuo dono da trava).
+        if alvo == self.selecionado:
+            return
+
+        # Trocar de seleção: solta a trava da seleção anterior (se houver).
+        if self.selecionado is not None:
+            self.client.desselecionar(self.selecionado)
+            self.selecionado = None
+
+        if alvo is not None:
+            concedido, motivo = self.client.selecionar(alvo)
+            if concedido:
+                self.selecionado = alvo
+            else:
+                messagebox.showwarning(
+                    "Seleção negada",
+                    motivo or "objeto selecionado por outro usuário")
+
+        self._redesenhar()
+        self._atualizar_status()
+
+    def _obj_em(self, x, y):
+        """Retorna o object_id do objeto sob o ponto (x, y), ou None."""
         itens = self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)
         for item in reversed(itens):
             tags = self.canvas.gettags(item)
             if tags:
-                self.selecionado = tags[0]
-                self._redesenhar()
-                self._atualizar_status()
-                return
-        self.selecionado = None
-        self._redesenhar()
-        self._atualizar_status()
+                return tags[0]
+        return None
 
     def _novo_id(self):
         self._contador += 1

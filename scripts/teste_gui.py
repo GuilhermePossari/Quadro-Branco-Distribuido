@@ -59,14 +59,27 @@ def main():
     assert tela.canvas.find_withtag("g2"), "objeto de B não renderizado"
     ok("Desenho de B (g2) propagou e foi renderizado na GUI de A")
 
-    titulo("GUI: erro de exclusão mútua não quebra a tela")
-    # B trava g1; A tenta colorir g1 → deve falhar silenciosamente (sem exceção)
-    B._solicitar_lock("g1")
-    tela.selecionado = "g1"
-    tela._set_cor("#1f77b4")     # dispara client.colorir → lock negado → on_error
-    pump(app, 0.3)
-    ok("Tentativa de colorir objeto travado tratada sem travar a GUI")
-    B._liberar_lock("g1")
+    titulo("GUI: exclusão mútua na SELEÇÃO")
+    # A seleciona g1 pela GUI (clique simulado no meio da linha) → adquire a trava
+    tela.ferramenta = "selecionar"
+    (x1, y1), (x2, y2) = tela.objetos["g1"]["points"]
+    tela._selecionar_em((x1 + x2) // 2, (y1 + y2) // 2)
+    pump(app, 0.2)
+    assert tela.selecionado == "g1", "A não conseguiu selecionar g1"
+    ok("A selecionou g1 (trava adquirida)")
+
+    # B tenta selecionar o MESMO objeto → negado (sem tocar a GUI de A)
+    concedido, motivo = B.selecionar("g1")
+    assert not concedido, "B não deveria selecionar objeto já selecionado por A"
+    ok(f"B foi recusado ao selecionar g1 — motivo: \"{motivo}\"")
+
+    # A deixa de selecionar → B consegue
+    A.desselecionar("g1")
+    tela.selecionado = None
+    concedido2, _ = B.selecionar("g1")
+    assert concedido2, "B deveria conseguir selecionar após A desselecionar"
+    ok("Após A desselecionar, B conseguiu selecionar g1")
+    B.desselecionar("g1")
 
     app.destroy()
     print("\n\033[1;92m=== SMOKE TEST GUI: PASSOU ===\033[0m")

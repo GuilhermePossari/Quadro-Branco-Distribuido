@@ -39,9 +39,13 @@ D2. ROTEAMENTO POR (TIPO, PAPEL) em `handle_message`.
 D3. OPERAÇÕES LOCAIS roteadas pelo papel:
       - se sou coordenador  → aplico no delegate (estado + broadcast) e na GUI;
       - se sou cliente comum → envio a operação ao coordenador via socket.
-    DRAW NÃO precisa de lock (qualquer um desenha). COLOR e REMOVE PRECISAM de
-    lock (exclusão mútua): LOCK_REQUEST → se concedido, opera e LOCK_RELEASE;
-    se negado, dispara on_error na GUI. (enunciado §3A)
+    DRAW NÃO precisa de lock (qualquer um desenha). A exclusão mútua (enunciado
+    §3A) acontece na SELEÇÃO: selecionar() ADQUIRE a trava do objeto
+    (LOCK_REQUEST) e desselecionar() a LIBERA (LOCK_RELEASE). Enquanto um nó
+    mantém um objeto selecionado, nenhum outro consegue selecioná-lo — e, como
+    só se opera sobre o objeto selecionado, ninguém mais consegue colori-lo ou
+    removê-lo. COLOR/REMOVE apenas operam sobre o objeto já travado por este nó;
+    seleção negada → mensagem de erro ao segundo cliente.
 
 D4. THREAD-SAFETY DA GUI (tkinter): a thread de rede NUNCA toca widgets direto.
     Todo callback de GUI passa por `self._ui(fn, *args)` → `master.after(0, ...)`.
@@ -76,12 +80,30 @@ O QUE FALTA IMPLEMENTAR (cada stub abaixo tem TODO específico)
 import threading
 
 import queue
+import socket
 
 import protocol
 from node import Node
 from coordinator import Coordinator
 from heartbeat import Heartbeat, construir_anel
 from election import Election
+
+
+def porta_livre(host: str = "0.0.0.0") -> int:
+    """
+    Pede ao SO uma porta TCP livre em `host` (bind em :0, lê e fecha).
+
+    Usada para abrir SESSÕES ADICIONAIS quando este processo já hospeda um quadro:
+    cada quadro vive numa sessão Client própria, com seu próprio servidor/porta —
+    assim o nó pode coordenar vários quadros ao mesmo tempo sem que um colida com
+    o outro no Serviço de Nomes (que mapeia nome → ip:porta).
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 class Client(Node):
@@ -185,6 +207,48 @@ class Client(Node):
             self.send_sem_resposta(m["ip"], m["port"], anuncio)
         self.stop()
 
+    def sair_do_quadro(self) -> bool:
+        """
+        "Voltar para a tela inicial" SEM encerrar o processo (≠ de sair()).
+
+        Regra de negócio pedida: o nó só deixa de ser coordenador quando o
+        PROCESSO é encerrado. Portanto, ao voltar para a tela inicial:
+
+          - CLIENTE COMUM (ou estado de lobby) → saio do quadro de fato:
+            envio LEAVE ao coordenador, paro o heartbeat e zero o estado local,
+            voltando esta sessão ao "lobby". Retorna True → o chamador pode
+            REAPROVEITAR esta mesma sessão (porta) para listar/criar/ingressar.
+
+          - COORDENADOR → NÃO abro mão do papel. O quadro continua hospedado
+            por mim em SEGUNDO PLANO: servidor, delegate de estado, heartbeat e
+            eleição seguem ativos; nada é desfeito. Retorna False → o chamador
+            deve MANTER esta sessão viva e usar OUTRA sessão no primeiro plano.
+            O papel só passa a outro nó quando o processo fecha (ver sair()).
+
+        Não chama stop() em nenhum caso (o processo continua vivo).
+        """
+        if self.sou_coordenador:
+            return False
+
+        self.heartbeat.parar()
+        if self.board_name is not None and self.coord_ip is not None:
+            self.send_sem_resposta(self.coord_ip, self.coord_port,
+                                   protocol.make_leave(self.node_id))
+        self._resetar_para_lobby()
+        return True
+
+    def _resetar_para_lobby(self):
+        """Zera o estado de quadro desta sessão, deixando-a pronta para um novo
+        ciclo de listar/criar/ingressar (estado de "lobby")."""
+        with self._estado_lock:
+            self.objetos = {}
+            self.membros = []
+        self.board_name      = None
+        self.coord_ip        = None
+        self.coord_port      = None
+        self.sou_coordenador = False
+        self._coord          = None
+
     # ==================================================================
     # Descoberta / Serviço de Nomes
     # ==================================================================
@@ -279,34 +343,41 @@ class Client(Node):
         self._rotear_operacao(msg)
         self._aplicar_na_gui(msg)
 
-    def remover(self, object_id: str):
+    def remover(self, object_id: str) -> bool:
         """
-        REMOVE — exige lock (D3, §3A). Pede a trava; se negada, avisa a GUI e aborta.
-        Retorna True se removeu, False se foi barrado pela exclusão mútua.
+        REMOVE. A exclusão mútua já está garantida pela SELEÇÃO (ver selecionar()):
+        só se remove um objeto que ESTE nó tem selecionado — portanto já travado por
+        ele. O coordenador libera a trava automaticamente ao remover o objeto
+        (coordinator.py::_tratar_remove). Retorna True.
         """
-        return self._operar_com_lock(
-            object_id, protocol.make_remove(object_id, self.node_id))
-
-    def colorir(self, object_id: str, color: str):
-        """
-        COLOR — exige lock (D3). Duas cores disponíveis (enunciado §1.1).
-        Mesmo fluxo de remover(): trava → opera → libera.
-        """
-        return self._operar_com_lock(
-            object_id, protocol.make_color(object_id, color, self.node_id))
-
-    def _operar_com_lock(self, object_id: str, msg: dict) -> bool:
-        """Sequência da exclusão mútua: LOCK_REQUEST → operação → LOCK_RELEASE."""
-        granted, reason = self._solicitar_lock(object_id)
-        if not granted:
-            self._ui(self.on_error, reason or "objeto em uso por outro usuário")
-            return False
-        try:
-            self._rotear_operacao(msg)
-            self._aplicar_na_gui(msg)
-        finally:
-            self._liberar_lock(object_id)
+        msg = protocol.make_remove(object_id, self.node_id)
+        self._rotear_operacao(msg)
+        self._aplicar_na_gui(msg)
         return True
+
+    def colorir(self, object_id: str, color: str) -> bool:
+        """
+        COLOR. Como em remover(), a exclusão mútua já foi garantida na seleção: o
+        objeto está travado por este nó. A trava permanece até a desseleção — a cor
+        pode ser reaplicada enquanto o objeto seguir selecionado. Retorna True.
+        """
+        msg = protocol.make_color(object_id, color, self.node_id)
+        self._rotear_operacao(msg)
+        self._aplicar_na_gui(msg)
+        return True
+
+    def selecionar(self, object_id: str) -> tuple:
+        """
+        Seleciona um objeto ADQUIRINDO sua trava no coordenador (exclusão mútua,
+        enunciado §3A). Enquanto este nó mantiver o objeto selecionado, nenhum
+        outro nó consegue selecioná-lo (nem, portanto, colori-lo ou removê-lo).
+        Retorna (concedido: bool, motivo: str). Coordenador indisponível = negado.
+        """
+        return self._solicitar_lock(object_id)
+
+    def desselecionar(self, object_id: str):
+        """Libera a trava de seleção, liberando o objeto para os outros nós."""
+        self._liberar_lock(object_id)
 
     def _solicitar_lock(self, object_id: str) -> tuple:
         """

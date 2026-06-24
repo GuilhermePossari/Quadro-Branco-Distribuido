@@ -83,13 +83,28 @@ quem caiu — por isso ela é descentralizada (anel).
   a lista de integrantes".
 - Atende explicitamente o enunciado, que cita o "Algoritmo do Valentão" como exemplo.
 
-### 2.7. Exclusão mútua: trava por objeto (lock simples no coordenador)
+### 2.7. Exclusão mútua: trava adquirida na SELEÇÃO (lock por objeto no coordenador)
 - O coordenador mantém `_locks = { object_id → node_id }`.
-- Antes de **colorir** ou **remover**, o cliente pede `LOCK_REQUEST`. Se o objeto já estiver
-  travado por outro, recebe `LOCK_RESPONSE(granted=False)` e a GUI mostra erro. Após a operação,
-  o cliente envia `LOCK_RELEASE`.
-- Travas de um membro são liberadas automaticamente quando ele sai ou cai.
-- Atende: "se o mesmo objeto foi selecionado por outro cliente, enviar mensagem de erro ao segundo".
+- **A trava é adquirida no momento da SELEÇÃO**, não no momento da operação — é o que o
+  enunciado §3A descreve ("selecionar objeto e selecionar operação, nessa sequência...
+  se o mesmo objeto foi selecionado por outro cliente, enviar mensagem de erro ao segundo").
+  - `client.selecionar(oid)` → `LOCK_REQUEST`. Se o objeto já está travado por outro nó,
+    `LOCK_RESPONSE(granted=False)` → a GUI mostra **"Seleção negada"** e o objeto **não** é
+    selecionado pelo segundo cliente.
+  - `client.desselecionar(oid)` → `LOCK_RELEASE`. A trava é solta quando o nó **deixa de
+    selecionar**: clica em outro objeto, clica no vazio, troca de ferramenta ou sai do quadro.
+- **Consequência:** enquanto um nó mantém um objeto selecionado, nenhum outro consegue
+  selecioná-lo — e, como só se opera sobre o objeto selecionado, ninguém mais consegue
+  **colori-lo nem removê-lo**. `COLOR`/`REMOVE` apenas operam sobre o objeto já travado por
+  este nó (não re-adquirem trava). `REMOVE` faz o coordenador liberar a trava automaticamente
+  (o objeto deixa de existir); após `COLOR` a trava permanece (o objeto segue selecionado).
+- **Histórico:** numa versão anterior a trava era transitória, só em volta de cada operação
+  (`LOCK_REQUEST` → opera → `LOCK_RELEASE`). Foi movida para a seleção para refletir o §3A —
+  o erro de concorrência aparece já na seleção do segundo cliente.
+- Travas de um membro são liberadas automaticamente quando ele sai ou cai
+  (`coordinator._remover_membro_interno`). Em handoff/eleição as travas não são transferidas
+  (o novo coordenador começa sem travas), o que é seguro: o nó que as detinha está saindo.
+- `DRAW` não usa trava (qualquer um desenha).
 
 ### 2.8. **Fora de escopo: 2PC (Two-Phase Commit)**
 - A seção 3B do enunciado original (transações atômicas via 2PC) foi **removida pelo professor**.
@@ -106,6 +121,40 @@ quem caiu — por isso ela é descentralizada (anel).
 - Coordenador **sozinho** no quadro sai/cai → o quadro é **encerrado** (desregistra do SN via
   `UNREGISTER`).
 - Pode haver **múltiplos quadros simultâneos**, cada um com seu coordenador registrado no SN.
+
+### 2.10. "Sair do quadro" e coordenador persistente — uma sessão por quadro
+- **Requisito:** a tela do quadro tem um botão **"Sair do quadro"** que volta à tela
+  inicial. Regra de negócio pedida: o nó **só deixa de ser coordenador quando o
+  processo é encerrado** — ao voltar para a tela inicial, um coordenador **continua
+  hospedando** o quadro; e pode inclusive **criar/ingressar em outro quadro** sem
+  largar o original.
+- **Decisão:** modelar **uma sessão `Client` por quadro**, cada uma com seu próprio
+  servidor TCP/porta. Um processo pode manter N sessões: a de **primeiro plano**
+  (refletida na tela atual) e as de **segundo plano** (quadros que ele continua
+  coordenando). Porta extra obtida via `client.porta_livre()` (bind em `:0`).
+- **Por que sessão-por-porta (e não discriminador de quadro no protocolo):** o
+  protocolo está **congelado** e as mensagens **não carregam o nome do quadro**; o SN
+  mapeia `nome → (ip, porta)`. Dar a cada quadro uma porta própria faz o protocolo
+  mono-quadro existente funcionar **sem nenhuma alteração na infra testada** — menor
+  risco. A alternativa (campo `board` em JOIN/DRAW/REMOVE/COLOR/LOCK_*/RING_UPDATE/
+  ELECTION/COORDINATOR) reescreveria o protocolo e o `coordinator.py`.
+- **Comportamento do botão (em `Client.sair_do_quadro()` + `App`):**
+  - **Cliente comum** → sai de fato: `LEAVE` ao coordenador, `heartbeat.parar()` e
+    reset ao "lobby". A **mesma sessão/porta é reaproveitada**. Retorna `True`.
+  - **Coordenador** → **não** abre mão do papel: a sessão segue ativa (servidor,
+    delegate, heartbeat, eleição) **em segundo plano**; a `App` move-a para
+    `self._fundo`, **desliga seus callbacks de GUI** (o estado interno continua
+    atualizando, só não toca a tela) e abre uma **nova sessão de primeiro plano**
+    (`App._nova_sessao()`) para o lobby. Retorna `False`.
+- **Encerramento do programa** = único momento em que o papel é cedido: `App._ao_fechar`
+  chama `sair()` em **todas** as sessões (primeiro plano + fundo), disparando o
+  handoff/eleição já existente (D6, §2.6). Coerente com "passa para outro nó".
+- **Isolamento entre quadros:** como cada sessão tem porta própria, broadcasts/heartbeats
+  de um quadro nunca chegam ao handler de outro — sem vazamento de estado. Custo: um
+  servidor TCP por quadro hospedado; irrelevante na escala da demo.
+- **Infra tocada:** **nenhuma.** Só foram *adicionados* `porta_livre()` e
+  `sair_do_quadro()`/`_resetar_para_lobby()` em `client.py` e o multiplexador de
+  sessões na `App` (`telas.py`). Coberto por `scripts/teste_multiquadro.py`.
 
 ---
 
@@ -184,7 +233,7 @@ bytes e o payload exato. Ambos retornam `None` se a conexão fechar.
 | Serviço de Nomes (descoberta sem IP hardcoded) | `name_service.py`; coordenador faz `REGISTER`, cliente faz `LIST` | ✅ infra pronta |
 | Entrada dinâmica + sincronização de estado | `JOIN` → coordenador responde `STATE` com todos os objetos | ✅ no coordenador / falta cliente |
 | Coordenador armazena membros e repassa ações | `_members` + broadcast em `DRAW`/`REMOVE`/`COLOR` | ✅ |
-| Exclusão mútua (cor/remoção) | trava por objeto via `LOCK_REQUEST`/`RESPONSE`/`RELEASE` | ✅ no coordenador / falta UI |
+| Exclusão mútua (cor/remoção) | trava por objeto adquirida na **seleção** via `LOCK_REQUEST`/`RESPONSE`/`RELEASE` (§2.7) | ✅ coordenador + UI |
 | Detecção de falha + eleição | heartbeat em anel + Bully; vencedor atualiza o SN | ✅ infra pronta |
 | Recuperação do coordenador (recupera membros) | vencedor sobe `Coordinator` com `get_state()` local | ✅ infra pronta |
 | Resiliência do SN | processo isolado, fixo, sem dependência dos demais | ✅ |

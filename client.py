@@ -75,6 +75,8 @@ O QUE FALTA IMPLEMENTAR (cada stub abaixo tem TODO específico)
 
 import threading
 
+import queue
+
 import protocol
 from node import Node
 from coordinator import Coordinator
@@ -100,6 +102,10 @@ class Client(Node):
         self.ns_host = ns_host
         self.ns_port = ns_port
         self.master = master          # raiz tkinter — usada por _ui() (D4). Pode ser None em testes.
+        # Fila de callbacks de GUI: a thread de rede só ENFILEIRA; a thread do
+        # tkinter drena via drenar_ui() (D4). Chamar master.after() direto da
+        # thread de rede dispara "main thread is not in main loop".
+        self._ui_queue = queue.Queue()
 
         # ── Identidade do quadro / papel ───────────────────────────────
         self.board_name: str = None
@@ -538,22 +544,36 @@ class Client(Node):
 
     def _ui(self, fn, *args):
         """
-        Executa `fn(*args)` na thread da GUI (D4).
+        Agenda `fn(*args)` para rodar na thread da GUI (D4).
 
-        Por que existe: handle_message roda numa thread de conexão do Node
-        (node.py:86). O tkinter NÃO é thread-safe — tocar um widget fora da
-        thread principal trava ou corrompe a GUI. `master.after(0, ...)` enfileira
-        a chamada para a thread do tkinter executar no próximo ciclo do mainloop.
+        handle_message roda numa thread de conexão do Node (node.py:86) e o tkinter
+        NÃO é thread-safe — nem `master.after()` pode ser chamado de outra thread
+        ("main thread is not in main loop"). Por isso apenas ENFILEIRAMOS aqui; a
+        thread do tkinter consome via drenar_ui() num poller periódico.
 
-        Sem `master` (testes sem GUI) chamamos direto. `fn` None é ignorado
-        (a GUI pode não ter registrado aquele callback).
+        Sem `master` (testes sem GUI) chamamos direto. `fn` None é ignorado.
         """
         if fn is None:
             return
         if self.master is not None:
-            self.master.after(0, lambda: fn(*args))
+            self._ui_queue.put((fn, args))
         else:
             fn(*args)
+
+    def drenar_ui(self):
+        """
+        Executa todos os callbacks de GUI pendentes. DEVE ser chamado pela thread
+        do tkinter (a App agenda um poller periódico com self.after()).
+        """
+        while True:
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn(*args)
+            except Exception as e:
+                print(f"[client] erro em callback de GUI: {e}")
 
     def _sincronizar_membros_do_coord(self):
         """

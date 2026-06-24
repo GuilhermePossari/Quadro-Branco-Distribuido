@@ -3,7 +3,7 @@
 > Foto do projeto após a implementação completa da lógica de rede da **Pessoa A**.
 > Lista o que **já foi feito** (com validação) e o que **ainda falta** para a entrega.
 
-_Atualizado em: 2026-06-18_
+_Atualizado em: 2026-06-18 (GUI + integração concluídas; resta demo interativa e relatório)_
 
 ---
 
@@ -30,15 +30,28 @@ Todos os blocos do `PLANO_IMPLEMENTACAO.md` implementados, **sem nenhum `NotImpl
     como o nó coordenador também está em `_members`, o auto-envio causava loop infinito.
     Correção universalmente válida (1 método).
 
+### `telas.py` + `main.py` — GUI tkinter integrada (feito agora)
+- **`telas.py`**: `App` (controlador + poller de UI), `TelaInicial` (CRIAR/INGRESSAR),
+  `TelaListaQuadros` (lista do SN + ingressar), `TelaQuadro` (canvas + toolbar:
+  Linha, Quadrado, 2 cores, Selecionar, Remover; seleção por hit-test; redesenho).
+- **`main.py`**: entrada `python main.py [porta] [ip] [--ns IP:PORTA]`; detecta o IP
+  real da interface (não 127.0.0.1) e sobe o `Client` + `App`. Fechar a janela chama
+  `client.sair()` (saída graciosa / handoff).
+- **Correção importante de thread-safety (no `client.py`):** `_ui` agora ENFILEIRA os
+  callbacks numa `queue.Queue`; a `App` os drena na thread do tkinter via poller
+  (`after(40, ...)`). Chamar `master.after()` da thread de rede dava
+  "main thread is not in main loop" — pego pelo smoke test da GUI.
+
 ### Testes automatizados (novos, em `scripts/`) — todos passando
 | Arquivo | Cobre | Resultado |
 |---|---|---|
 | `scripts/_comum.py` | Infra de teste: sobe SN + cria clientes com timeouts reduzidos | — |
 | `scripts/teste_cenario_1_2.py` | **Cenário 1** (entrada dinâmica + onboarding) e **Cenário 2** (broadcast + exclusão mútua) | ✅ passa |
 | `scripts/teste_cenario_3.py` | **Cenário 3** (morte do coordenador → detecção → Bully → recuperação de estado → SN reapontado → quadro operante) | ✅ passa |
+| `scripts/teste_gui.py` | Integração GUI↔rede: criar quadro, desenho local, broadcast remoto na tela, erro de lock sem travar a GUI | ✅ passa |
 
-> Rodam sem GUI (`Client(master=None)` torna os callbacks no-ops). Da raiz:
-> `python scripts/teste_cenario_1_2.py` e `python scripts/teste_cenario_3.py`.
+> Cenários 1–3 rodam sem GUI (`Client(master=None)`). O smoke test da GUI dirige a
+> `App` sem `mainloop` (via `update()`). Da raiz: `python scripts/<arquivo>.py`.
 
 ### Contrato estável para a GUI (consumido por `telas.py`)
 - **Métodos:** `criar_quadro(nome)`, `listar_quadros()`, `ingressar_em_quadro(board)`,
@@ -52,40 +65,18 @@ Todos os blocos do `PLANO_IMPLEMENTACAO.md` implementados, **sem nenhum `NotImpl
 
 ## ❌ O que falta
 
-### 1. `telas.py` — GUI tkinter (Pessoa B) — **bloco principal restante**
-- `TelaInicial`: CRIAR (pede nome via `simpledialog`) / INGRESSAR.
-- `TelaListaQuadros`: `client.listar_quadros()` → `Listbox` → `client.ingressar_em_quadro`.
-- `TelaQuadro`: `Canvas` + toolbar (Linha, Quadrado, 2 cores, Remover, Selecionar);
-  captura de cliques (2 pontos p/ linha/quadrado); seleção visual antes de colorir/remover.
-- Implementar os callbacks (`receber_draw`, etc.) e ligá-los a `client.on_*`.
-- Passar a referência `client` entre as telas.
+### 1. Demonstração interativa (com janelas, em 2 máquinas)
+Os scripts automatizados já provam a lógica dos 3 cenários, mas a **demo da entrega**
+deve ser feita com as janelas abertas. Falta apenas executar/ensaiar:
+- Subir `python name_service.py`, depois `python main.py 6001`, `6002`, `6003`...
+- Repetir os 3 cenários visualmente (entrada, concorrência, matar o coordenador).
+- Teste real **Ubuntu ↔ WSL**: conferir os IPs das interfaces (`ip addr`); o SN
+  precisa estar num endereço alcançável pelos dois; passar o IP próprio em `main.py`
+  se a autodetecção pegar a interface errada.
 
-### 2. Integração GUI ↔ rede
-- Instanciar o `Client` com o `master` (raiz tkinter) e o **IP real** da máquina
-  (não `0.0.0.0`/`127.0.0.1`) — exigido para os outros nós alcançarem este nó.
-- Fechar a janela deve chamar `client.sair()` (saída graciosa / handoff).
-
-### 3. Testes de demonstração com GUI
-- Repetir os 3 cenários **visualmente** (com janelas), além dos scripts automatizados.
-- Teste real entre **2 máquinas** (Ubuntu ↔ WSL): conferir IPs das interfaces; o nó
-  deve se anunciar com o IP alcançável pela outra máquina.
-
-### 4. Relatório (10% da nota)
+### 2. Relatório (10% da nota) — **excluído deste ciclo a pedido**
 - Já coberto em parte por `DECISOES_PROJETO.md` (decisões + protocolo) e este arquivo.
-- Falta: seção de **fluxo de uso / telas** (Pessoa B) e fechamento do relatório.
-
----
-
-## Divisão do que resta
-
-| Frente | Responsável | Depende de |
-|---|---|---|
-| `telas.py` (todas as telas + canvas + callbacks) | **Pessoa B** | nada (contrato já estável) |
-| Integração GUI↔rede + saída graciosa na janela | **Pessoa B** (A apoia) | `telas.py` |
-| Demo visual dos 3 cenários | A + B | integração |
-| Teste 2 máquinas (Ubuntu↔WSL) | A + B | integração |
-| Relatório: protocolo/decisões | **Pessoa A** | incremental |
-| Relatório: fluxo de uso/telas | **Pessoa B** | `telas.py` |
+- Falta: seção de **fluxo de uso / telas** e fechamento.
 
 ---
 
@@ -94,7 +85,8 @@ Todos os blocos do `PLANO_IMPLEMENTACAO.md` implementados, **sem nenhum `NotImpl
 | Camada | Estado |
 |---|---|
 | Infra (`protocol`, `node`, `name_service`, `coordinator`, `heartbeat`, `election`) | ✅ pronta (+1 ajuste anti-loop) |
-| `client.py` (rede — Pessoa A) | ✅ **completo e testado** |
-| Scripts de teste (cenários 1, 2, 3) | ✅ passando |
-| `telas.py` (GUI — Pessoa B) | ❌ a fazer |
-| Integração visual + demo + relatório | 🟡 parcial |
+| `client.py` (rede — Pessoa A) | ✅ completo e testado (+fix de fila no `_ui`) |
+| `telas.py` + `main.py` (GUI — Pessoa B) | ✅ **feito e integrado** |
+| Scripts de teste (cenários 1, 2, 3 + smoke GUI) | ✅ passando |
+| Demo interativa (2 máquinas) | 🟡 a executar/ensaiar |
+| Relatório | ⏸️ adiado a pedido |

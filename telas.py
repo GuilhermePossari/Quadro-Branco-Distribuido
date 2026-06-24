@@ -1,190 +1,329 @@
-import tkinter as tk 
+"""
+telas.py — Interface gráfica (tkinter) do SDWB.
+
+A GUI NUNCA fala socket: só chama métodos do `Client` e reage aos callbacks
+(on_draw, on_remove, on_color, on_error, on_state_loaded, on_coord_changed).
+Todos os callbacks já chegam na thread do tkinter (Client._ui usa master.after),
+então é seguro tocar widgets diretamente neles.
+
+Estrutura:
+  App            — controlador: guarda o Client, troca de tela, registra callbacks.
+  TelaInicial    — CRIAR / INGRESSAR.
+  TelaListaQuadros — lista quadros do Serviço de Nomes e ingressa.
+  TelaQuadro     — canvas + toolbar (linha, quadrado, 2 cores, remover, selecionar).
+"""
+
+import tkinter as tk
 from tkinter import simpledialog, messagebox
-import uuid 
-from client import Client # Importa a classe Client que cuida da rede (o esqueleto do seu parceiro).
 
-class TelaInicial(tk.Frame): # Herda de tk.Frame, ou seja, esta classe É um "recipiente" visual.
-    def __init__(self, master=None, client=None):
-        super().__init__(master) # Inicializa o Frame passando a janela principal (master).
-        self.master = master # Guarda a referência da janela principal (a raiz do app).
-        self.client = client # Guarda a instância do cliente de rede (Injeção de Dependência).
-        self.pack(fill="both", expand=True) # Diz para este Frame ocupar todo o espaço da janela.
-        self.create_widgets() # Chama a função que desenha os botões e textos na tela.
+# Duas cores disponíveis (enunciado §1.1)
+COR_A = "#d62728"   # vermelho
+COR_B = "#1f77b4"   # azul
+COR_PADRAO = "#000000"
 
-    def create_widgets(self):
-        # Cria um rótulo (texto) e o coloca na tela com um espaçamento vertical (pady).
-        self.label = tk.Label(self, text="Museu histórico da CompArte", font=("Arial", 14, "bold"))
-        self.label.pack(pady=30) 
 
-        # Cria os botões, atrelando a ação (command) às funções específicas da classe.
-        self.button1 = tk.Button(self, text="CRIAR NOVO QUADRO", command=self.criar_quadro, width=30)
-        self.button1.pack(pady=10)
+class App(tk.Tk):
+    """Janela raiz e controlador de telas. Recebe um Client já instanciado."""
 
-        self.button2 = tk.Button(self, text="INGRESSAR EM QUADRO EXISTENTE", command=self.ir_para_lista, width=30)
-        self.button2.pack(pady=10)
-        
-    def criar_quadro(self):
-        # Abre um pop-up pedindo o nome. O programa pausa aqui até o usuário digitar e dar OK.
-        nome = simpledialog.askstring("Novo Quadro", "Digite o nome do quadro:")
-        if nome: # Se o usuário não cancelou...
-            sucesso = self.client.criar_quadro(nome) # ...pede para a rede criar o quadro.
-            if sucesso:
-                self.destroy() # Destrói a tela inicial atual (limpa a janela).
-                TelaQuadro(self.master, self.client) # Instancia a tela de desenho, passando a janela e o cliente.
-            else:
-                messagebox.showerror("Erro", "Não foi possível criar o quadro.") # Pop-up de erro se a rede falhar.
-        
-    def ir_para_lista(self):
-        self.destroy() # Limpa a tela atual.
-        TelaListaQuadros(self.master, self.client) # Abre a tela de listar quadros.
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+        client.master = self          # _ui() passa a enfileirar para esta janela
+        self.title(f"SDWB — {client.node_id}")
+        self.geometry("900x650")
+
+        self._container = tk.Frame(self)
+        self._container.pack(fill="both", expand=True)
+        self._tela_atual = None
+
+        # Liga os callbacks de rede aos métodos da tela do quadro.
+        # (definidos aqui no controlador; redirecionam para a TelaQuadro ativa)
+        client.on_state_loaded  = self._cb_state_loaded
+        client.on_draw          = self._cb_draw
+        client.on_remove        = self._cb_remove
+        client.on_color         = self._cb_color
+        client.on_error         = self._cb_error
+        client.on_coord_changed = self._cb_coord_changed
+
+        self.protocol("WM_DELETE_WINDOW", self._ao_fechar)
+        self.mostrar(TelaInicial)
+        self._poll_ui()               # drena callbacks de rede na thread do tkinter
+
+    def _poll_ui(self):
+        """Consome a fila de callbacks do Client (thread-safety da GUI, D4)."""
+        self.client.drenar_ui()
+        self.after(40, self._poll_ui)
+
+    # ── Troca de telas ────────────────────────────────────────────────
+    def mostrar(self, classe_tela, **kwargs):
+        if self._tela_atual is not None:
+            self._tela_atual.destroy()
+        self._tela_atual = classe_tela(self._container, self, **kwargs)
+        self._tela_atual.pack(fill="both", expand=True)
+        return self._tela_atual
+
+    # ── Callbacks de rede → repassam à TelaQuadro se for a tela ativa ──
+    def _quadro(self):
+        return self._tela_atual if isinstance(self._tela_atual, TelaQuadro) else None
+
+    def _cb_state_loaded(self, objetos):
+        q = self._quadro()
+        if q: q.carregar_estado(objetos)
+
+    def _cb_draw(self, obj):
+        q = self._quadro()
+        if q: q.receber_draw(obj)
+
+    def _cb_remove(self, object_id):
+        q = self._quadro()
+        if q: q.receber_remove(object_id)
+
+    def _cb_color(self, object_id, color):
+        q = self._quadro()
+        if q: q.receber_color(object_id, color)
+
+    def _cb_error(self, msg):
+        messagebox.showwarning("Operação negada", msg)
+
+    def _cb_coord_changed(self, ip, port, sou_coord):
+        q = self._quadro()
+        if q: q.atualizar_papel(sou_coord, ip, port)
+
+    # ── Encerramento gracioso ─────────────────────────────────────────
+    def _ao_fechar(self):
+        try:
+            self.client.sair()       # LEAVE / handoff / encerra quadro (D6)
+        except Exception:
+            pass
+        self.destroy()
+
+
+class TelaInicial(tk.Frame):
+    """Primeira tela: criar um quadro novo ou ingressar num existente."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+
+        tk.Label(self, text="Quadro Branco Distribuído",
+                 font=("Arial", 22, "bold")).pack(pady=(80, 10))
+        tk.Label(self, text=f"Este nó: {app.client.node_id}",
+                 font=("Arial", 11), fg="#666").pack(pady=(0, 40))
+
+        tk.Button(self, text="CRIAR NOVO QUADRO", width=28, height=2,
+                  command=self._criar).pack(pady=8)
+        tk.Button(self, text="INGRESSAR EM QUADRO EXISTENTE", width=28, height=2,
+                  command=self._ingressar).pack(pady=8)
+
+    def _criar(self):
+        nome = simpledialog.askstring("Criar quadro", "Nome do novo quadro:", parent=self)
+        if not nome:
+            return
+        if self.app.client.criar_quadro(nome):
+            self.app.mostrar(TelaQuadro, nome=nome)
+        else:
+            messagebox.showerror("Erro", f"Já existe um quadro chamado '{nome}'.")
+
+    def _ingressar(self):
+        self.app.mostrar(TelaListaQuadros)
 
 
 class TelaListaQuadros(tk.Frame):
-    def __init__(self, master=None, client=None):
+    """Lista os quadros registrados no Serviço de Nomes e permite ingressar."""
+
+    def __init__(self, master, app):
         super().__init__(master)
-        self.master = master
-        self.client = client
-        self.quadros_disponiveis = [] # Lista local para guardar os quadros que vierem da rede.
-        self.pack(fill="both", expand=True)
-        self.create_widgets()
-        self.carregar_lista() # Assim que a tela nasce, já pede a lista para a rede.
+        self.app = app
+        self._boards = []
 
-    def create_widgets(self):
-        self.label = tk.Label(self, text="Selecione um quadro para ingressar:", font=("Arial", 12))
-        self.label.pack(pady=10)
-        
-        # Listbox é um componente visual do Tkinter para listas selecionáveis.
-        self.listbox = tk.Listbox(self, width=50, height=10)
-        self.listbox.pack(pady=10)
+        tk.Label(self, text="Quadros disponíveis",
+                 font=("Arial", 18, "bold")).pack(pady=(30, 15))
 
-        self.btn_entrar = tk.Button(self, text="Entrar no Quadro", command=self.entrar_quadro)
-        self.btn_entrar.pack(pady=5)
+        self._listbox = tk.Listbox(self, width=50, height=12, font=("Arial", 12))
+        self._listbox.pack(pady=10)
 
-        self.btn_voltar = tk.Button(self, text="Voltar ao Menu", command=self.voltar)
-        self.btn_voltar.pack(pady=5)
+        barra = tk.Frame(self)
+        barra.pack(pady=10)
+        tk.Button(barra, text="Atualizar", width=12, command=self._atualizar).pack(side="left", padx=5)
+        tk.Button(barra, text="Ingressar", width=12, command=self._ingressar).pack(side="left", padx=5)
+        tk.Button(barra, text="Voltar", width=12,
+                  command=lambda: app.mostrar(TelaInicial)).pack(side="left", padx=5)
 
-    def carregar_lista(self):
-        # Pede os quadros para o client.py. Ele vai falar com o Serviço de Nomes.
-        self.quadros_disponiveis = self.client.listar_quadros() 
-        self.listbox.delete(0, tk.END) # Limpa a lista visual antes de preencher.
-        for q in self.quadros_disponiveis:
-            # Insere cada quadro na interface visual (mostra nome, IP e porta).
-            self.listbox.insert(tk.END, f"{q['name']} ({q['ip']}:{q['port']})")
+        self._atualizar()
 
-    def entrar_quadro(self):
-        selecao = self.listbox.curselection() # Retorna uma tupla com os índices selecionados (ex: (0,)).
-        if not selecao:
-            messagebox.showwarning("Aviso", "Selecione um quadro primeiro.")
-            return # Aborta a função se nada foi selecionado.
-        
-        # Pega o dicionário do quadro usando o índice que o usuário clicou.
-        quadro_selecionado = self.quadros_disponiveis[selecao[0]] 
-        # Tenta ingressar via rede.
-        sucesso = self.client.ingressar_em_quadro(quadro_selecionado)
-        
-        if sucesso:
-            self.destroy()
-            TelaQuadro(self.master, self.client) # Vai para o canvas!
+    def _atualizar(self):
+        self._boards = self.app.client.listar_quadros()
+        self._listbox.delete(0, tk.END)
+        for b in self._boards:
+            self._listbox.insert(tk.END, f"{b['name']}  ({b['ip']}:{b['port']})")
+        if not self._boards:
+            self._listbox.insert(tk.END, "(nenhum quadro ativo)")
+
+    def _ingressar(self):
+        sel = self._listbox.curselection()
+        if not sel or not self._boards:
+            return
+        board = self._boards[sel[0]]
+        if self.app.client.ingressar_em_quadro(board):
+            self.app.mostrar(TelaQuadro, nome=board["name"])
         else:
-            messagebox.showerror("Erro", "Falha ao ingressar no quadro.")
-
-    def voltar(self):
-        self.destroy()
-        TelaInicial(self.master, self.client)
+            messagebox.showerror("Erro", "Não foi possível ingressar (coordenador indisponível).")
+            self._atualizar()
 
 
 class TelaQuadro(tk.Frame):
-    def __init__(self, master=None, client=None):
+    """
+    Canvas colaborativo + toolbar. Mantém um espelho local dos objetos para
+    redesenhar; cada item do canvas leva o object_id como tag para hit-test.
+    """
+
+    def __init__(self, master, app, nome=""):
         super().__init__(master)
-        self.master = master
-        self.client = client
-        self.pack(fill="both", expand=True)
-        
-        # Variáveis do Tkinter que atualizam a interface automaticamente quando mudam.
-        self.ferramenta_atual = tk.StringVar(value="line") 
-        self.cor_atual = tk.StringVar(value="black")
-        
-        self.pontos_temp = [] # Guarda os cliques (1º clique inicia a reta, 2º finaliza).
-        self.objetos_canvas = {} # Dicionário para relacionar o ID da rede com o ID da linha desenhada na tela.
+        self.app = app
+        self.client = app.client
+        self.nome = nome
 
-        # A MÁGICA: Ligamos as funções desta tela aos "gatilhos" (callbacks) do cliente de rede.
-        self.client.on_draw = self.receber_draw 
-        self.client.on_error = self.mostrar_erro
-        
-        self.create_widgets()
+        self.objetos = {}          # object_id -> {id, shape, points, color}
+        self.ferramenta = "linha"  # 'linha' | 'quadrado' | 'selecionar'
+        self.cor_atual = COR_A
+        self.pontos_temp = []      # cliques acumulados para linha/quadrado
+        self.selecionado = None    # object_id selecionado
+        self._contador = 0         # para gerar ids únicos por nó
 
-    def create_widgets(self):
-        toolbar = tk.Frame(self) # Um sub-container só para os botões do topo.
-        toolbar.pack(side=tk.TOP, fill=tk.X, pady=5)
+        self._montar_toolbar()
+        self._montar_canvas()
+        self._montar_status()
+        self._redesenhar()
 
-        # Radiobuttons são botões de múltipla escolha. Eles mudam o valor da variável "ferramenta_atual".
-        tk.Radiobutton(toolbar, text="Linha", variable=self.ferramenta_atual, value="line").pack(side=tk.LEFT)
-        tk.Radiobutton(toolbar, text="Quadrado", variable=self.ferramenta_atual, value="square").pack(side=tk.LEFT)
-        
-        tk.Label(toolbar, text="| Cor:").pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(toolbar, text="Preto", variable=self.cor_atual, value="black").pack(side=tk.LEFT)
-        tk.Radiobutton(toolbar, text="Vermelho", variable=self.cor_atual, value="red").pack(side=tk.LEFT)
+    # ── Layout ────────────────────────────────────────────────────────
+    def _montar_toolbar(self):
+        tb = tk.Frame(self, bd=1, relief="raised")
+        tb.pack(side="top", fill="x")
 
-        self.btn_voltar = tk.Button(toolbar, text="Sair do Quadro", command=self.voltar)
-        self.btn_voltar.pack(side=tk.RIGHT, padx=10)
+        tk.Button(tb, text="Linha", width=8,
+                  command=lambda: self._set_ferramenta("linha")).pack(side="left", padx=2, pady=4)
+        tk.Button(tb, text="Quadrado", width=8,
+                  command=lambda: self._set_ferramenta("quadrado")).pack(side="left", padx=2)
+        tk.Button(tb, text="Selecionar", width=10,
+                  command=lambda: self._set_ferramenta("selecionar")).pack(side="left", padx=2)
 
-        # Cria a área desenhável.
+        tk.Label(tb, text="  Cor:").pack(side="left")
+        tk.Button(tb, bg=COR_A, width=3, command=lambda: self._set_cor(COR_A)).pack(side="left", padx=2)
+        tk.Button(tb, bg=COR_B, width=3, command=lambda: self._set_cor(COR_B)).pack(side="left", padx=2)
+
+        tk.Button(tb, text="Remover", width=8, command=self._remover).pack(side="left", padx=12)
+
+    def _montar_canvas(self):
         self.canvas = tk.Canvas(self, bg="white", cursor="cross")
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Diz ao Tkinter: "Toda vez que o botão esquerdo do mouse (<Button-1>) for clicado aqui, chame 'on_click'".
-        self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._clique)
 
-    def on_click(self, event):
-        # O 'event' traz as coordenadas (x e y) de onde o mouse clicou.
-        self.pontos_temp.append([event.x, event.y]) 
-        
-        # Um desenho (linha ou quadrado) precisa de 2 pontos (início e fim).
+    def _montar_status(self):
+        self.status = tk.Label(self, anchor="w", relief="sunken", bd=1)
+        self.status.pack(side="bottom", fill="x")
+        self._atualizar_status()
+
+    def _atualizar_status(self):
+        papel = "COORDENADOR" if self.client.sou_coordenador else "cliente"
+        sel = f" | sel: {self.selecionado}" if self.selecionado else ""
+        self.status.config(
+            text=f"Quadro: {self.nome}  [{papel}]  | ferramenta: {self.ferramenta}"
+                 f"  | cor: {self.cor_atual}{sel}")
+
+    # ── Toolbar handlers ──────────────────────────────────────────────
+    def _set_ferramenta(self, f):
+        self.ferramenta = f
+        self.pontos_temp = []
+        self._atualizar_status()
+
+    def _set_cor(self, cor):
+        self.cor_atual = cor
+        # Se há objeto selecionado, aplicar a cor a ele (exclusão mútua via Client)
+        if self.selecionado:
+            self.client.colorir(self.selecionado, cor)
+        self._atualizar_status()
+
+    def _remover(self):
+        if not self.selecionado:
+            messagebox.showinfo("Remover", "Selecione um objeto primeiro.")
+            return
+        oid = self.selecionado
+        if self.client.remover(oid):
+            self.selecionado = None
+        self._atualizar_status()
+
+    # ── Interação no canvas ───────────────────────────────────────────
+    def _clique(self, event):
+        if self.ferramenta == "selecionar":
+            self._selecionar_em(event.x, event.y)
+            return
+
+        self.pontos_temp.append([event.x, event.y])
         if len(self.pontos_temp) == 2:
-            # Monta o pacote no formato esperado pelo protocolo da rede.
-            novo_objeto = {
-                "id": str(uuid.uuid4()), # Gera um ID aleatório tipo "123e4567-e89b-12d3-a456-426614174000".
-                "shape": self.ferramenta_atual.get(),
-                "points": self.pontos_temp.copy(),
-                "color": self.cor_atual.get()
+            obj = {
+                "id": self._novo_id(),
+                "shape": "line" if self.ferramenta == "linha" else "square",
+                "points": list(self.pontos_temp),
+                "color": self.cor_atual,
             }
-            # ATENÇÃO: Nós NÃO desenhamos aqui. Apenas enviamos para a rede.
-            self.client.desenhar(novo_objeto) 
-            self.pontos_temp = [] # Limpa a lista para o próximo desenho.
+            self.pontos_temp = []
+            self.client.desenhar(obj)   # atualiza réplica + broadcast; eco volta via _aplicar_na_gui
+
+    def _selecionar_em(self, x, y):
+        itens = self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)
+        for item in reversed(itens):
+            tags = self.canvas.gettags(item)
+            if tags:
+                self.selecionado = tags[0]
+                self._redesenhar()
+                self._atualizar_status()
+                return
+        self.selecionado = None
+        self._redesenhar()
+        self._atualizar_status()
+
+    def _novo_id(self):
+        self._contador += 1
+        return f"{self.client.node_id}-{self._contador}"
+
+    # ── Renderização ──────────────────────────────────────────────────
+    def _redesenhar(self):
+        self.canvas.delete("all")
+        for oid, obj in self.objetos.items():
+            self._desenhar_obj(obj, destaque=(oid == self.selecionado))
+
+    def _desenhar_obj(self, obj, destaque=False):
+        (x1, y1), (x2, y2) = obj["points"]
+        cor = obj["color"]
+        largura = 4 if destaque else 2
+        if obj["shape"] == "line":
+            self.canvas.create_line(x1, y1, x2, y2, fill=cor, width=largura, tags=(obj["id"],))
+        else:
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline=cor, width=largura, tags=(obj["id"],))
+        if destaque:
+            self.canvas.create_rectangle(
+                min(x1, x2) - 5, min(y1, y2) - 5, max(x1, x2) + 5, max(y1, y2) + 5,
+                outline="#888", dash=(3, 3))
+
+    # ── Callbacks de rede (chamados via App, já na thread do tkinter) ──
+    def carregar_estado(self, objetos):
+        self.objetos = {o["id"]: o for o in objetos}
+        self._redesenhar()
 
     def receber_draw(self, obj):
-        # Esta função só roda quando chega uma mensagem da rede (seja a sua que voltou, ou a de um amigo).
-        shape = obj.get("shape")
-        pts = obj.get("points")
-        color = obj.get("color")
-        obj_id = obj.get("id")
+        self.objetos[obj["id"]] = obj
+        self._redesenhar()
 
-        if shape == "line":
-            # Cria a linha visualmente e guarda o ID interno que o Tkinter gera.
-            item = self.canvas.create_line(pts[0][0], pts[0][1], pts[1][0], pts[1][1], fill=color, width=2)
-        elif shape == "square":
-            item = self.canvas.create_rectangle(pts[0][0], pts[0][1], pts[1][0], pts[1][1], outline=color, width=2)
-            
-        self.objetos_canvas[obj_id] = item # Guarda no dicionário: ID_da_rede -> ID_do_Tkinter.
+    def receber_remove(self, object_id):
+        self.objetos.pop(object_id, None)
+        if self.selecionado == object_id:
+            self.selecionado = None
+        self._redesenhar()
 
-    def mostrar_erro(self, mensagem):
-        messagebox.showerror("Erro na Rede", mensagem)
+    def receber_color(self, object_id, color):
+        if object_id in self.objetos:
+            self.objetos[object_id]["color"] = color
+        self._redesenhar()
 
-    def voltar(self):
-        self.client.sair() # Avisa a infraestrutura de rede que estamos vazando.
-        self.destroy()
-        TelaInicial(self.master, self.client)
-
-
-if __name__ == "__main__":
-    root = tk.Tk() # Criando a janela principal 
-    root.title("App - CompArte")
-    root.geometry("800x600") 
-
-    # Instanciamos O MOTOR DE REDE primeiro.
-    meu_cliente = Client(host="127.0.0.1", port=6001, ns_host="127.0.0.1", ns_port=5000, master=root)
-    # Passamos a janela raiz (root) e o motor (meu_cliente) para a primeira tela.
-    app = TelaInicial(master=root, client=meu_cliente)
-    
-    # Entrega o controle do programa para o loop infinito do Tkinter.
-    app.mainloop()
+    def atualizar_papel(self, sou_coord, ip, port):
+        self._atualizar_status()

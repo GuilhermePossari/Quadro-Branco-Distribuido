@@ -1,7 +1,6 @@
 """
-protocol.py — Contrato de mensagens do SDWB
-Ambos (Pessoa A e Pessoa B) importam este arquivo.
-Nunca escreva {"type": "JOIN"} na mão em outro arquivo — use as constantes daqui.
+protocol.py: tipos de mensagem, construtores e framing TCP.
+Vocabulário comum importado por todos os processos.
 """
 
 import json
@@ -53,11 +52,9 @@ ERROR          = "ERROR"
 
 
 # ---------------------------------------------------------------------------
-# Framing TCP — prefixo de 4 bytes com o tamanho do payload
+# Framing TCP: cada mensagem é prefixada por 4 bytes big-endian com o tamanho
+# do payload JSON, para delimitar mensagens no stream.
 # ---------------------------------------------------------------------------
-# TCP é um stream: sem framing, não dá para saber onde uma mensagem termina
-# e a próxima começa. A solução é prefixar cada mensagem com 4 bytes (big-endian)
-# indicando o comprimento do JSON que vem a seguir.
 
 def encode(msg: dict) -> bytes:
     """Serializa um dict para bytes prontos para enviar pelo socket."""
@@ -89,7 +86,7 @@ def decode(sock: socket.socket):
 
 
 # ---------------------------------------------------------------------------
-# Construtores — use estas funções em vez de montar dicts na mão
+# Construtores de mensagem
 # ---------------------------------------------------------------------------
 
 # Serviço de Nomes
@@ -111,27 +108,22 @@ def make_join(ip: str, port: int) -> dict:
     return {"type": JOIN, "ip": ip, "port": port}
 
 def make_state(objects: list, members: list) -> dict:
-    # objects: lista de objetos do quadro (cada um é um dict com id, shape, points, color)
-    # members: lista de {"ip": str, "port": int}
     return {"type": STATE, "objects": objects, "members": members}
 
-# Operações
+# Operações.
+# obj = {"id": str, "shape": "line"|"square", "points": [[x,y],[x,y]], "color": str}
+# sender_id = "ip:porta" do autor, para o coordenador não reenviar a quem originou.
 def make_draw(obj: dict, sender_id: str) -> dict:
-    # obj deve ter: {"id": str, "shape": "line"|"square", "points": [[x,y],[x,y]], "color": str}
-    # sender_id: "ip:porta" de quem está desenhando (para o coord. não reenviar ao remetente)
     return {"type": DRAW, "object": obj, "sender_id": sender_id}
 
 def make_remove(object_id: str, sender_id: str) -> dict:
-    # sender_id: "ip:porta" de quem está removendo
     return {"type": REMOVE, "object_id": object_id, "sender_id": sender_id}
 
 def make_color(object_id: str, color: str, sender_id: str) -> dict:
-    # sender_id: "ip:porta" de quem está colorindo
     return {"type": COLOR, "object_id": object_id, "color": color, "sender_id": sender_id}
 
 # Exclusão mútua
 def make_lock_request(object_id: str, node_id: str) -> dict:
-    # node_id: "ip:porta" de quem quer a trava (porta do servidor do cliente, não a efêmera)
     return {"type": LOCK_REQUEST, "object_id": object_id, "node_id": node_id}
 
 def make_lock_response(object_id: str, granted: bool, reason: str = "") -> dict:
@@ -142,7 +134,6 @@ def make_lock_release(object_id: str) -> dict:
 
 # Heartbeat
 def make_heartbeat(node_id: str) -> dict:
-    # node_id: "ip:porta" do nó que está pingando
     return {"type": HEARTBEAT, "node_id": node_id}
 
 def make_heartbeat_ok(node_id: str) -> dict:
@@ -150,7 +141,6 @@ def make_heartbeat_ok(node_id: str) -> dict:
 
 # Eleição
 def make_election(candidate_id: str) -> dict:
-    # candidate_id: "ip:porta" de quem iniciou a eleição
     return {"type": ELECTION, "candidate_id": candidate_id}
 
 def make_election_ok() -> dict:
@@ -160,12 +150,10 @@ def make_coordinator(ip: str, port: int) -> dict:
     return {"type": COORDINATOR, "ip": ip, "port": port}
 
 def make_ring_update(members: list) -> dict:
-    # members: anel completo [{"ip": str, "port": int}] já ordenado
     return {"type": RING_UPDATE, "members": members}
 
 # Saída
 def make_leave(node_id: str) -> dict:
-    # node_id: "ip:porta" de quem está saindo
     return {"type": LEAVE, "node_id": node_id}
 
 # Utilitários

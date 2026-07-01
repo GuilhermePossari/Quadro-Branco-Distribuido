@@ -1,32 +1,10 @@
 """
-heartbeat.py — Heartbeat em anel para o SDWB
+heartbeat.py: detecção de falhas em anel.
 
-Como funciona:
-  - O anel é uma lista ordenada de nós: [coord, clienteA, clienteB, ...]
-  - Cada nó pinga o próximo no anel a cada T segundos
-  - Cada ping tem timeout de 2T; um ping perdido conta como um "strike"
-  - Só após max_falhas pings perdidos consecutivos o vizinho é declarado morto
-    (evita falsos positivos por blip de rede / coordenador ocupado)
-  - Se o morto era o coordenador → dispara eleição (on_coordenador_falhou)
-  - Se era um cliente comum     → notifica o coordenador (on_membro_falhou)
-
-Uso típico (dentro do cliente):
-    hb = Heartbeat(meu_ip, minha_porta, intervalo=2.0)
-    hb.on_membro_falhou      = lambda ip, p: node.send(coord_ip, coord_port,
-                                               protocol.make_leave(f'{ip}:{p}'))
-    hb.on_coordenador_falhou = lambda: election.iniciar()
-    hb.iniciar(
-        send_fn   = node.send,
-        ring      = construir_anel(membros, coord_ip, coord_port),
-        coord_ip  = coord_ip,
-        coord_port= coord_port,
-    )
-
-    # Quando receber RING_UPDATE do coordenador:
-    hb.atualizar_anel(msg["members"])
-
-    # Quando a eleição eleger um novo coordenador:
-    hb.atualizar_coordenador(novo_coord_ip, novo_coord_port)
+O anel é a lista ordenada de nós (coordenador incluído). Cada nó pinga o próximo
+a cada T segundos; após max_falhas pings perdidos seguidos, o vizinho é dado como
+morto. Se o morto era o coordenador, dispara eleição; se era um cliente comum,
+avisa o coordenador.
 """
 
 import time
@@ -35,21 +13,12 @@ import protocol
 
 
 # ---------------------------------------------------------------------------
-# Função utilitária — usada por coordinator.py e client.py
+# Utilitário compartilhado por coordinator.py e client.py
 # ---------------------------------------------------------------------------
 
 def construir_anel(members: list, coord_ip: str, coord_port: int) -> list:
-    """
-    Constrói o anel de heartbeat: coordenador + todos os membros, ordenados
-    por (ip, port). Qualquer nó que chamar esta função com os mesmos dados
-    obtém o mesmo anel — garante que todos concordem sobre quem pinga quem.
-
-    Parâmetros:
-      members    — lista de clientes: [{"ip": str, "port": int}]
-      coord_ip/port — endereço do coordenador
-
-    Retorna lista ordenada incluindo o coordenador.
-    """
+    """Monta o anel (coordenador + membros) ordenado por (ip, port). Determinística:
+    com os mesmos dados, todos os nós obtêm o mesmo anel."""
     coord = {"ip": coord_ip, "port": coord_port}
     todos = list(members)
     if coord not in todos:
@@ -62,21 +31,17 @@ def construir_anel(members: list, coord_ip: str, coord_port: int) -> list:
 # ---------------------------------------------------------------------------
 
 class Heartbeat:
-    """
-    Gerencia o heartbeat em anel de um único nó.
-    Instanciar um por processo (cliente ou coordenador).
-    """
+    """Heartbeat em anel de um nó. Um por processo."""
 
     def __init__(self, own_ip: str, own_port: int, intervalo: float = 2.0,
                  max_falhas: int = 3):
         self.own_ip    = own_ip
         self.own_port  = own_port
         self.own_id    = f"{own_ip}:{own_port}"
-        self.intervalo = intervalo          # T — segundos entre pings
+        self.intervalo = intervalo          # T, segundos entre pings
 
-        # Nº de pings perdidos consecutivos antes de declarar o vizinho morto.
-        # Evita falsos positivos (blip de rede, GC, coord ocupado em broadcast)
-        # que disparariam eleições espúrias com um único ping perdido.
+        # Pings perdidos seguidos antes de declarar o vizinho morto (evita falso
+        # positivo por oscilação de rede ou coordenador ocupado).
         self.max_falhas = max_falhas
 
         self._ring: list  = []             # anel atual
@@ -86,12 +51,11 @@ class Heartbeat:
         self._thread      = None
         self._send        = None           # injetado em iniciar()
 
-        # Contador de strikes do vizinho atualmente monitorado.
-        # Só é tocado pela thread do loop (_checar_vizinho), não precisa de lock.
-        self._vizinho_monitorado = None    # "ip:porta" a que o contador se refere
+        # Contador de pings perdidos do vizinho atual. Só a thread do loop mexe.
+        self._vizinho_monitorado = None
         self._falhas_consecutivas = 0
 
-        # ── Callbacks — defina antes de chamar iniciar() ──────────────
+        # Callbacks: definir antes de iniciar().
         self.on_membro_falhou: callable      = None   # fn(ip: str, port: int)
         self.on_coordenador_falhou: callable = None   # fn()
 
@@ -100,13 +64,7 @@ class Heartbeat:
     # ------------------------------------------------------------------
 
     def iniciar(self, send_fn, ring: list, coord_ip: str, coord_port: int):
-        """
-        Liga o heartbeat.
-
-        send_fn    — Node.send (injetado para evitar dependência circular)
-        ring       — anel inicial (use construir_anel())
-        coord_ip/port — coordenador atual
-        """
+        """Liga o heartbeat. send_fn é o Node.send; ring é o anel inicial."""
         if self._running:
             return   # já está rodando
 
@@ -144,10 +102,7 @@ class Heartbeat:
         print(f"[HB {self.own_id}] Anel atualizado — {len(novo_ring)} nó(s)")
 
     def atualizar_coordenador(self, coord_ip: str, coord_port: int):
-        """
-        Registra o novo coordenador após eleição.
-        Sem isso, o heartbeat continuaria tentando pingar o coordenador morto.
-        """
+        """Registra o novo coordenador após eleição, para não pingar o antigo."""
         with self._lock:
             self._coord_id = f"{coord_ip}:{coord_port}"
         print(f"[HB {self.own_id}] Coordenador atualizado → {self._coord_id}")
@@ -165,15 +120,14 @@ class Heartbeat:
     def _checar_vizinho(self):
         vizinho = self._proximo_vizinho()
         if vizinho is None:
-            # Anel com ≤ 1 nó — nada a pingar. Zera o contador.
+            # Anel com um nó só: nada a pingar.
             self._vizinho_monitorado = None
             self._falhas_consecutivas = 0
             return
 
         vz_id = f"{vizinho['ip']}:{vizinho['port']}"
 
-        # Se o vizinho mudou (entrada/saída de nó, RING_UPDATE), recomeça a
-        # contagem — strikes só fazem sentido contra um mesmo alvo.
+        # Vizinho mudou: reinicia a contagem (só vale contra um mesmo alvo).
         if vz_id != self._vizinho_monitorado:
             self._vizinho_monitorado = vz_id
             self._falhas_consecutivas = 0
@@ -186,11 +140,9 @@ class Heartbeat:
         )
 
         if resp is not None and resp.get("type") == protocol.HEARTBEAT_OK:
-            # Respondeu — zera os strikes acumulados.
             self._falhas_consecutivas = 0
             return
 
-        # Ping perdido — acumula strike.
         self._falhas_consecutivas += 1
         print(f"[HB {self.own_id}] Vizinho {vz_id} não respondeu "
               f"({self._falhas_consecutivas}/{self.max_falhas}).")

@@ -1,80 +1,15 @@
 """
-client.py — Cliente do SDWB (lógica de rede)  [ESQUELETO / a implementar]
+client.py: lógica de rede do terminal.
 
-Este arquivo é o "cérebro" de rede de cada terminal. A GUI (telas.py) NÃO fala
-socket diretamente: ela chama métodos do `Client` e registra callbacks para ser
-notificada quando algo chega da rede. Toda a infraestrutura abaixo já está pronta
-e testada — o `Client` apenas a orquestra:
+A interface (telas.py) não fala socket: chama métodos do Client e é avisada por
+callbacks, sempre entregues de forma segura para a thread da interface. O Client
+consulta o Serviço de Nomes, cria e ingressa em quadros, encaminha as operações
+da tela ao coordenador, aplica as operações recebidas e integra o heartbeat e a
+eleição.
 
-    protocol.py   — contrato de mensagens + framing
-    node.py       — Node: servidor TCP + send/send_sem_resposta
-    coordinator.py— Coordinator(Node): motor de estado autoritativo + broadcast
-    heartbeat.py  — Heartbeat em anel (com contador de strikes)
-    election.py   — Election (Bully)
-
-═══════════════════════════════════════════════════════════════════════════════
-DECISÕES DE DESIGN (derivadas do código atual — SEGUIR estas)
-═══════════════════════════════════════════════════════════════════════════════
-
-D1. UM ÚNICO SERVIDOR POR PROCESSO (Design B — "coordenador é um dos clientes").
-    O `Client` é quem herda `Node` e abre o servidor TCP na sua porta P. Quando
-    este terminal vira coordenador, NÃO subimos um segundo servidor numa outra
-    porta: reutilizamos o `Coordinator` apenas como MOTOR DE ESTADO (delegate),
-    SEM chamar `coordinator.start()`/`start_server()`. Assim:
-      - a porta P do cliente == endereço do coordenador no Serviço de Nomes;
-      - `election.py:159` anuncia `(own_ip, own_port)` == P → CORRETO sem alteração;
-      - `construir_anel` (heartbeat) trata o coordenador como UM nó (dedup em :53);
-      - NENHUM arquivo de infra precisa ser alterado.
-
-D2. ROTEAMENTO POR (TIPO, PAPEL) em `handle_message`.
-    A mesma mensagem significa coisas diferentes conforme o papel deste nó:
-      - DRAW/REMOVE/COLOR recebidos por um CLIENTE comum  = broadcast → atualizar GUI.
-      - DRAW/REMOVE/COLOR recebidos pelo COORDENADOR       = submissão de cliente
-        → delegar a `self._coord.handle_message(msg, addr)` (atualiza estado
-          autoritativo + faz broadcast aos OUTROS) e TAMBÉM atualizar a GUI local.
-    O `Client` sempre dirige a GUI; o `Coordinator` delegate só cuida do estado
-    autoritativo e do broadcast. Por isso NÃO é preciso callback de GUI no
-    Coordinator (evita mexer na infra).
-
-D3. OPERAÇÕES LOCAIS roteadas pelo papel:
-      - se sou coordenador  → aplico no delegate (estado + broadcast) e na GUI;
-      - se sou cliente comum → envio a operação ao coordenador via socket.
-    DRAW NÃO precisa de lock (qualquer um desenha). A exclusão mútua (enunciado
-    §3A) acontece na SELEÇÃO: selecionar() ADQUIRE a trava do objeto
-    (LOCK_REQUEST) e desselecionar() a LIBERA (LOCK_RELEASE). Enquanto um nó
-    mantém um objeto selecionado, nenhum outro consegue selecioná-lo — e, como
-    só se opera sobre o objeto selecionado, ninguém mais consegue colori-lo ou
-    removê-lo. COLOR/REMOVE apenas operam sobre o objeto já travado por este nó;
-    seleção negada → mensagem de erro ao segundo cliente.
-
-D4. THREAD-SAFETY DA GUI (tkinter): a thread de rede NUNCA toca widgets direto.
-    Todo callback de GUI passa por `self._ui(fn, *args)` → `master.after(0, ...)`.
-
-D5. CONEXÃO POR MENSAGEM (não persistente), igual ao resto do sistema: usar
-    `self.send(...)` (espera resposta, retorna None em falha — SEMPRE checar None)
-    e `self.send_sem_resposta(...)` para fire-and-forget. node_id == "ip:porta".
-
-D6. CICLO DE VIDA / FALHAS (regras de negócio):
-      - criador do quadro ENTRA como membro de si mesmo (senão a regra
-        "coordenador sozinho sai → quadro encerra" não dispara). Ver `criar_quadro`.
-      - saída voluntária → LEAVE + heartbeat.parar(); se eu for o coordenador e
-        houver outros, NÃO há eleição automática (decisão de aula) → tratar handoff;
-        se eu for o coordenador sozinho → o delegate já desregistra do SN.
-      - vitória na eleição → semear `Coordinator` com a réplica local de objetos +
-        membros conhecidos, virar coordenador e ATUALIZAR o SN com meu endereço
-        (REGISTER) — requisito do enunciado §3A/§4.
-
-═══════════════════════════════════════════════════════════════════════════════
-O QUE FALTA IMPLEMENTAR (cada stub abaixo tem TODO específico)
-═══════════════════════════════════════════════════════════════════════════════
-  [ ] Descoberta: listar_quadros / criar_quadro / ingressar_em_quadro
-  [ ] handle_message: roteador completo (D2) + HEARTBEAT/RING_UPDATE/ELECTION/COORD
-  [ ] Operações de GUI: desenhar / remover / colorir + fluxo de lock (D3)
-  [ ] Virar coordenador (delegate + registro no SN) e callbacks de eleição
-  [ ] Wiring de Heartbeat e Election (injeção de send_fn, ring, membros, callbacks)
-  [ ] Saída (sair) cobrindo os casos de D6
-  [ ] Réplica local de estado (self.objetos / self.membros) consistente com STATE
-      e com cada broadcast recebido
+Quando o terminal cria um quadro ou vence uma eleição, ele passa a acumular o
+papel de coordenador no mesmo processo e na mesma porta, reaproveitando o
+Coordinator apenas como motor de estado, sem abrir um segundo servidor.
 """
 
 import threading
@@ -90,14 +25,8 @@ from election import Election
 
 
 def porta_livre(host: str = "0.0.0.0") -> int:
-    """
-    Pede ao SO uma porta TCP livre em `host` (bind em :0, lê e fecha).
-
-    Usada para abrir SESSÕES ADICIONAIS quando este processo já hospeda um quadro:
-    cada quadro vive numa sessão Client própria, com seu próprio servidor/porta —
-    assim o nó pode coordenar vários quadros ao mesmo tempo sem que um colida com
-    o outro no Serviço de Nomes (que mapeia nome → ip:porta).
-    """
+    """Retorna uma porta TCP livre. Usada para abrir uma sessão por quadro quando
+    o processo hospeda mais de um, cada uma com seu próprio servidor e porta."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind((host, 0))
@@ -107,80 +36,60 @@ def porta_livre(host: str = "0.0.0.0") -> int:
 
 
 class Client(Node):
-    """
-    Cliente do SDWB. Herda `Node` (já fornece servidor TCP + send/recv).
-
-    Uso esperado pela GUI (telas.py):
-        cli = Client("0.0.0.0", 6001, ns_host="127.0.0.1", ns_port=5000, master=root)
-        cli.on_draw  = tela.receber_draw        # callbacks (ver seção "Callbacks")
-        cli.on_error = tela.mostrar_erro
-        cli.start()
-        quadros = cli.listar_quadros()
-        cli.ingressar_em_quadro(quadros[0])      # ou cli.criar_quadro("Meu Quadro")
-    """
+    """Terminal do SDWB. Herda Node (servidor TCP e envio)."""
 
     def __init__(self, host: str, port: int, ns_host: str, ns_port: int, master=None):
         super().__init__(host, port)
         self.ns_host = ns_host
         self.ns_port = ns_port
-        self.master = master          # raiz tkinter — usada por _ui() (D4). Pode ser None em testes.
-        # Fila de callbacks de GUI: a thread de rede só ENFILEIRA; a thread do
-        # tkinter drena via drenar_ui() (D4). Chamar master.after() direto da
-        # thread de rede dispara "main thread is not in main loop".
+        self.master = master          # raiz tkinter usada por _ui(); None nos testes
+        # A thread de rede só enfileira callbacks aqui; a thread da interface os
+        # consome em drenar_ui(). Tocar tkinter fora dela quebra a interface.
         self._ui_queue = queue.Queue()
 
-        # ── Identidade do quadro / papel ───────────────────────────────
+        # Identidade do quadro e papel deste nó.
         self.board_name: str = None
         self.coord_ip: str = None
         self.coord_port: int = None
         self.sou_coordenador: bool = False
-        self._coord: Coordinator = None      # delegate de estado quando sou coordenador (D1)
+        self._coord: Coordinator = None      # motor de estado quando sou coordenador
 
-        # ── Réplica local do estado (mantida por STATE + broadcasts) ───
+        # Réplica local do estado, mantida pelo STATE inicial e pelas retransmissões.
         self.objetos: dict = {}              # { object_id: {id, shape, points, color} }
-        self.membros: list = []              # [{"ip": str, "port": int}] (inclui o coordenador)
+        self.membros: list = []              # [{"ip": str, "port": int}], inclui o coordenador
         self._estado_lock = threading.Lock()
 
-        # ── Subsistemas P2P (configurados no ingresso/criação) ─────────
+        # Heartbeat e eleição, configurados ao criar ou ingressar em um quadro.
         self.heartbeat: Heartbeat = Heartbeat(host, port)
         self.eleicao: Election    = Election(host, port)
 
-        # ── Callbacks para a GUI (telas.py atribui; todos opcionais) ───
-        # Sempre disparados via _ui() → thread-safe (D4).
-        self.on_state_loaded: callable = None  # fn(objetos: list)          — após JOIN/STATE
-        self.on_draw: callable         = None  # fn(obj: dict)              — novo objeto
+        # Callbacks para a interface (opcionais), sempre disparados via _ui().
+        self.on_state_loaded: callable = None  # fn(objetos: list)
+        self.on_draw: callable         = None  # fn(obj: dict)
         self.on_remove: callable       = None  # fn(object_id: str)
         self.on_color: callable        = None  # fn(object_id: str, color)
-        self.on_error: callable        = None  # fn(mensagem: str)          — ex: lock negado
-        self.on_coord_changed: callable = None # fn(ip, port, sou_coord)    — eleição/handoff (opcional)
+        self.on_error: callable        = None  # fn(mensagem: str)
+        self.on_coord_changed: callable = None # fn(ip, port, sou_coord)
 
     # ==================================================================
     # Ciclo de vida
     # ==================================================================
 
     def start(self):
-        """Sobe o servidor TCP do cliente (D1: este é o ÚNICO servidor do processo)."""
+        """Sobe o servidor TCP deste nó (o único do processo)."""
         self.start_server()
 
     def sair(self):
         """
-        Saída voluntária (D6). Três casos, decididos pelo papel/quantidade de membros:
-
-          1. Cliente comum  → envia LEAVE ao coordenador (ele me remove do anel).
-          2. Coordenador COM outros → HANDOFF sem eleição: escolho o sucessor de
-             maior (ip,porta) — mesma regra do Bully — e anuncio COORDINATOR(sucessor)
-             a todos. O sucessor assume com a réplica local dele. Decisão de aula:
-             saída voluntária NÃO dispara eleição.
-          3. Coordenador SOZINHO → encerro o quadro (UNREGISTER no SN).
-
-        Limitação conhecida do handoff: por ~6s (até o heartbeat do sucessor me
-        pingar e falhar), o sucessor ainda me terá no anel. Auto-corrige via HB.
-        Se o anúncio COORDINATOR se perder, o heartbeat detecta minha ausência e a
-        eleição assume como fallback — o quadro nunca fica órfão de forma permanente.
+        Saída ao encerrar o programa. Três casos conforme o papel:
+          1. Cliente comum: envia LEAVE ao coordenador.
+          2. Coordenador com outros membros: transfere o papel ao sucessor de maior
+             (ip, porta), sem eleição, e avisa os demais.
+          3. Coordenador sozinho: encerra o quadro (UNREGISTER no Serviço de Nomes).
         """
         self.heartbeat.parar()
 
-        # Caso 1 — cliente comum
+        # Caso 1: cliente comum
         if not self.sou_coordenador:
             if self.coord_ip is not None:
                 self.send_sem_resposta(self.coord_ip, self.coord_port,
@@ -188,24 +97,21 @@ class Client(Node):
             self.stop()
             return
 
-        # Sou coordenador: separar os OUTROS (membros exceto eu)
+        # Sou coordenador: separa os demais membros (todos exceto eu).
         membros = self._coord.get_state()["members"]
         outros = [m for m in membros
                   if not (m["ip"] == self.host and m["port"] == self.port)]
 
-        # Caso 3 — coordenador sozinho
+        # Caso 3: coordenador sozinho
         if not outros:
             self.send_sem_resposta(self.ns_host, self.ns_port,
                                    protocol.make_unregister(self.board_name))
             self.stop()
             return
 
-        # Caso 2 — handoff CONFIRMADO: tenta os sucessores do maior (ip,porta) para
-        # o menor (mesmo critério do Bully). Só considera transferido se o sucessor
-        # RESPONDER (self.send espera o OK de Election.tratar_coordinator). Se NENHUM
-        # sucessor vivo responder, NÃO orfana o quadro: desregistra do SN. Isso evita
-        # o "quadro fantasma" quando o sucessor escolhido também está caindo (ex.:
-        # fechar o app inteiro, com várias sessões saindo juntas) ou já morreu.
+        # Caso 2: tenta os sucessores do maior (ip, porta) para o menor. Só considera
+        # transferido se o sucessor responder. Se nenhum vivo assumir, desregistra o
+        # quadro em vez de deixá-lo órfão no Serviço de Nomes.
         candidatos = sorted(outros, key=lambda m: (m["ip"], m["port"]), reverse=True)
         sucessor = None
         for c in candidatos:
@@ -216,13 +122,12 @@ class Client(Node):
                 break
 
         if sucessor is None:
-            # Ninguém vivo para assumir → desregistra (em vez de deixar órfão no SN).
             self.send_sem_resposta(self.ns_host, self.ns_port,
                                    protocol.make_unregister(self.board_name))
             self.stop()
             return
 
-        # Avisa os DEMAIS membros para atualizarem a referência ao novo coordenador.
+        # Avisa os demais membros do novo coordenador.
         anuncio = protocol.make_coordinator(sucessor["ip"], sucessor["port"])
         for m in outros:
             if m["ip"] == sucessor["ip"] and m["port"] == sucessor["port"]:
@@ -232,23 +137,13 @@ class Client(Node):
 
     def sair_do_quadro(self) -> bool:
         """
-        "Voltar para a tela inicial" SEM encerrar o processo (≠ de sair()).
+        Volta à tela inicial sem encerrar o processo (diferente de sair()).
 
-        Regra de negócio pedida: o nó só deixa de ser coordenador quando o
-        PROCESSO é encerrado. Portanto, ao voltar para a tela inicial:
-
-          - CLIENTE COMUM (ou estado de lobby) → saio do quadro de fato:
-            envio LEAVE ao coordenador, paro o heartbeat e zero o estado local,
-            voltando esta sessão ao "lobby". Retorna True → o chamador pode
-            REAPROVEITAR esta mesma sessão (porta) para listar/criar/ingressar.
-
-          - COORDENADOR → NÃO abro mão do papel. O quadro continua hospedado
-            por mim em SEGUNDO PLANO: servidor, delegate de estado, heartbeat e
-            eleição seguem ativos; nada é desfeito. Retorna False → o chamador
-            deve MANTER esta sessão viva e usar OUTRA sessão no primeiro plano.
-            O papel só passa a outro nó quando o processo fecha (ver sair()).
-
-        Não chama stop() em nenhum caso (o processo continua vivo).
+        Cliente comum: sai de fato (LEAVE, para o heartbeat e volta ao lobby) e
+        retorna True, para o chamador reaproveitar esta sessão.
+        Coordenador: mantém o papel e o quadro ativos em segundo plano e retorna
+        False, para o chamador manter esta sessão e usar outra no primeiro plano.
+        O papel só é cedido no encerramento do programa (ver sair()).
         """
         if self.sou_coordenador:
             return False
@@ -261,8 +156,7 @@ class Client(Node):
         return True
 
     def _resetar_para_lobby(self):
-        """Zera o estado de quadro desta sessão, deixando-a pronta para um novo
-        ciclo de listar/criar/ingressar (estado de "lobby")."""
+        """Zera o estado do quadro, deixando a sessão pronta para um novo ciclo."""
         with self._estado_lock:
             self.objetos = {}
             self.membros = []
@@ -277,24 +171,16 @@ class Client(Node):
     # ==================================================================
 
     def listar_quadros(self) -> list:
-        """
-        Consulta o Serviço de Nomes e retorna [{"name", "ip", "port"}, ...].
-        Retorna [] se o SN estiver fora do ar (send → None, D5).
-        """
+        """Consulta o Serviço de Nomes. Retorna [{"name", "ip", "port"}, ...],
+        ou [] se ele estiver fora do ar."""
         resp = self.send(self.ns_host, self.ns_port, protocol.make_list())
         if resp is None or resp.get("type") != protocol.LIST_RESPONSE:
             return []
         return resp.get("boards", [])
 
     def criar_quadro(self, nome: str) -> bool:
-        """
-        Cria um quadro novo: este terminal já nasce coordenador (D1).
-        Retorna False se já existe um quadro com esse nome (evita sobrescrever
-        o REGISTER de outro coordenador no SN — name_service.py:44).
-
-        IMPORTANTE: host/port aqui devem ser o IP REAL acessível pelos outros nós,
-        não "0.0.0.0"/"127.0.0.1" — é este endereço que vai para o SN e para o anel.
-        """
+        """Cria um quadro e assume como coordenador. Retorna False se já existir um
+        quadro com esse nome."""
         if nome in {b["name"] for b in self.listar_quadros()}:
             return False
 
@@ -302,23 +188,20 @@ class Client(Node):
         self.coord_ip   = self.host
         self.coord_port = self.port
 
-        # D6: o criador entra como membro de si mesmo — senão a regra
-        # "coordenador sozinho sai → quadro encerra" nunca dispararia.
+        # O criador entra como membro de si mesmo, senão a regra "coordenador
+        # sozinho sai encerra o quadro" nunca dispararia.
         meu_endereco = {"ip": self.host, "port": self.port}
         self._virar_coordenador(objetos=[], membros=[meu_endereco])
 
-        # Anel/eleição iniciais com um único nó (eu). O HB não terá vizinho para
-        # pingar (anel de 1), mas já fica armado para quando alguém ingressar.
+        # Anel e eleição já armados com um nó só, prontos para quando alguém ingressar.
         self._setup_heartbeat(construir_anel([meu_endereco], self.host, self.port))
         self._setup_election([meu_endereco])
         return True
 
     def ingressar_em_quadro(self, board: dict) -> bool:
-        """
-        Ingressa num quadro existente. `board` = {"name", "ip", "port"} (vindo do SN).
-        Faz o onboarding: JOIN → recebe STATE (coordinator.py:112) → popula a réplica
-        local → arma heartbeat/eleição. Retorna False se o coordenador não responder.
-        """
+        """Ingressa em um quadro existente: envia JOIN, recebe o STATE, popula a
+        réplica local e arma heartbeat e eleição. Retorna False se o coordenador
+        não responder. board = {"name", "ip", "port"}."""
         self.board_name = board["name"]
         self.coord_ip   = board["ip"]
         self.coord_port = board["port"]
@@ -330,7 +213,7 @@ class Client(Node):
 
         with self._estado_lock:
             self.objetos = {o["id"]: o for o in resp["objects"]}
-            self.membros = list(resp["members"])     # já me inclui (coordinator.py:117)
+            self.membros = list(resp["members"])     # o coordenador já me incluiu
             objetos = list(self.objetos.values())
             membros = list(self.membros)
 
@@ -346,74 +229,51 @@ class Client(Node):
     # ==================================================================
 
     def _rotear_operacao(self, msg: dict):
-        """
-        Encaminha uma operação ao coordenador e devolve a resposta (D3):
-          - sou coordenador  → chamo o delegate em processo (sem socket);
-          - sou cliente comum → envio via socket ao coordenador.
-        Retorna o dict de resposta (ou None se o coordenador remoto não respondeu).
-        """
+        """Encaminha a operação ao coordenador: chama o motor local se sou
+        coordenador, senão envia por socket. Retorna a resposta ou None."""
         if self.sou_coordenador:
             return self._coord.handle_message(msg, None)
         return self.send(self.coord_ip, self.coord_port, msg)
 
     def desenhar(self, obj: dict):
-        """
-        DRAW — sem lock (D3). obj = {id, shape: 'line'|'square', points, color}.
-        Roteia ao coordenador (que faz broadcast aos outros) e atualiza a tela local
-        de forma otimista — o coordenador me exclui do broadcast (sender_id).
-        """
+        """DRAW, sem trava. Roteia ao coordenador e aplica na tela local."""
         msg = protocol.make_draw(obj, self.node_id)
         self._rotear_operacao(msg)
         self._aplicar_na_gui(msg)
 
     def remover(self, object_id: str) -> bool:
-        """
-        REMOVE. A exclusão mútua já está garantida pela SELEÇÃO (ver selecionar()):
-        só se remove um objeto que ESTE nó tem selecionado — portanto já travado por
-        ele. O coordenador libera a trava automaticamente ao remover o objeto
-        (coordinator.py::_tratar_remove). Retorna True.
-        """
+        """REMOVE do objeto selecionado (já travado por este nó). O coordenador
+        libera a trava ao remover."""
         msg = protocol.make_remove(object_id, self.node_id)
         self._rotear_operacao(msg)
         self._aplicar_na_gui(msg)
         return True
 
     def colorir(self, object_id: str, color: str) -> bool:
-        """
-        COLOR. Como em remover(), a exclusão mútua já foi garantida na seleção: o
-        objeto está travado por este nó. A trava permanece até a desseleção — a cor
-        pode ser reaplicada enquanto o objeto seguir selecionado. Retorna True.
-        """
+        """COLOR do objeto selecionado (já travado por este nó). A trava permanece
+        até a desseleção."""
         msg = protocol.make_color(object_id, color, self.node_id)
         self._rotear_operacao(msg)
         self._aplicar_na_gui(msg)
         return True
 
     def selecionar(self, object_id: str) -> tuple:
-        """
-        Seleciona um objeto ADQUIRINDO sua trava no coordenador (exclusão mútua,
-        enunciado §3A). Enquanto este nó mantiver o objeto selecionado, nenhum
-        outro nó consegue selecioná-lo (nem, portanto, colori-lo ou removê-lo).
-        Retorna (concedido: bool, motivo: str). Coordenador indisponível = negado.
-        """
+        """Seleciona um objeto adquirindo sua trava no coordenador. Retorna
+        (concedido, motivo). Coordenador indisponível conta como negado."""
         return self._solicitar_lock(object_id)
 
     def desselecionar(self, object_id: str):
-        """Libera a trava de seleção, liberando o objeto para os outros nós."""
+        """Libera a trava, deixando o objeto disponível para os outros nós."""
         self._liberar_lock(object_id)
 
     def _solicitar_lock(self, object_id: str) -> tuple:
-        """
-        Pede a trava ao coordenador (coordinator.py:180). Retorna (granted, reason).
-        Coordenador indisponível conta como negação (não dá para garantir exclusão).
-        """
+        """Pede a trava ao coordenador. Retorna (granted, reason)."""
         resp = self._rotear_operacao(protocol.make_lock_request(object_id, self.node_id))
         if resp is None or resp.get("type") != protocol.LOCK_RESPONSE:
             return False, "coordenador indisponível"
         return resp.get("granted", False), resp.get("reason", "")
 
     def _liberar_lock(self, object_id: str):
-        """Libera a trava após a operação (coordinator.py:198)."""
         self._rotear_operacao(protocol.make_lock_release(object_id))
 
     # ==================================================================
@@ -421,39 +281,36 @@ class Client(Node):
     # ==================================================================
 
     def handle_message(self, msg: dict, addr: tuple):
-        """
-        Roteador central (D2). Roda na thread de conexão do Node (node.py:86) —
-        NUNCA toca a GUI direto; sempre via _ui(). O significado de uma operação
-        depende do meu papel (cliente comum vs. coordenador).
-        """
+        """Roteia a mensagem recebida conforme o tipo e o papel deste nó. Roda na
+        thread de conexão; nunca toca a interface direto, sempre via _ui()."""
         tipo = msg.get("type")
 
-        # --- Operações de quadro: significado depende do papel (D2) ---
+        # Operações do quadro: o significado depende do papel.
         if tipo in (protocol.DRAW, protocol.REMOVE, protocol.COLOR):
             if self.sou_coordenador:
-                # Submissão de um cliente: estado autoritativo + broadcast aos outros...
+                # Submissão de um cliente: atualiza o estado, retransmite e mostra na tela.
                 resp = self._coord.handle_message(msg, addr)
-                self._aplicar_na_gui(msg)        # ...e atualizo minha própria tela
+                self._aplicar_na_gui(msg)
                 return resp
-            # Sou cliente comum: isto é um broadcast do coordenador → só a tela
+            # Cliente comum: é uma retransmissão do coordenador, só atualiza a tela.
             self._aplicar_na_gui(msg)
             return protocol.make_ok()
 
-        # --- Mensagens que só o coordenador processa ---
+        # Mensagens que só o coordenador processa.
         if tipo in (protocol.JOIN, protocol.LOCK_REQUEST,
                     protocol.LOCK_RELEASE, protocol.LEAVE):
             if not self.sou_coordenador:
                 return protocol.make_error("não sou o coordenador deste quadro")
             resp = self._coord.handle_message(msg, addr)
             if tipo in (protocol.JOIN, protocol.LEAVE):
-                self._sincronizar_membros_do_coord()   # membros mudaram → atualizar HB/eleição
+                self._sincronizar_membros_do_coord()   # membros mudaram
             return resp
 
-        # --- Heartbeat: respondo sempre (estou no anel), qualquer papel ---
+        # Heartbeat: respondido em qualquer papel, pois estou no anel.
         if tipo == protocol.HEARTBEAT:
             return protocol.make_heartbeat_ok(self.node_id)
 
-        # --- Anel atualizado pelo coordenador ---
+        # Anel atualizado pelo coordenador.
         if tipo == protocol.RING_UPDATE:
             anel = msg["members"]
             self.heartbeat.atualizar_anel(anel)
@@ -463,7 +320,7 @@ class Client(Node):
             self.eleicao.atualizar_membros(vivos)
             return protocol.make_ok()
 
-        # --- Eleição (Bully): delegar aos handlers prontos (election.py) ---
+        # Eleição: delega aos handlers do Election.
         if tipo == protocol.ELECTION:
             return self.eleicao.tratar_election(msg)
         if tipo == protocol.COORDINATOR:
@@ -472,13 +329,8 @@ class Client(Node):
         return protocol.make_error(f"tipo desconhecido: {tipo}")
 
     def _aplicar_na_gui(self, msg: dict):
-        """
-        Atualiza a réplica local de estado e dispara o callback de GUI via _ui().
-
-        É o caminho ÚNICO por onde uma operação (própria ou de outro nó) chega à
-        tela. Primeiro mexe em self.objetos sob _estado_lock; só depois notifica a
-        GUI (que então roda na thread do tkinter). Formato do objeto: protocol.py:119.
-        """
+        """Atualiza a réplica local de estado e notifica a tela via _ui(). Caminho
+        único por onde uma operação, própria ou de outro nó, chega à interface."""
         tipo = msg.get("type")
 
         if tipo == protocol.DRAW:
@@ -502,27 +354,20 @@ class Client(Node):
             self._ui(self.on_color, oid, cor)
 
     # ==================================================================
-    # Virar coordenador (criação OU vitória na eleição) — D1, D6
+    # Virar coordenador (na criação ou ao vencer a eleição)
     # ==================================================================
 
     def _virar_coordenador(self, objetos, membros: list):
-        """
-        Promove este terminal a coordenador usando o Coordinator como delegate (D1).
-        Chamado em DOIS momentos: ao criar um quadro, e ao vencer/receber um handoff.
-
-        `objetos` pode ser lista ou dict_values (vem de self.objetos.values()).
-        """
+        """Promove este terminal a coordenador, usando o Coordinator como motor de
+        estado. Chamado ao criar um quadro e ao vencer ou receber a transferência."""
         self._coord = Coordinator(self.board_name, self.host, self.port,
                                   self.ns_host, self.ns_port)
 
-        # Semeia o estado SEM subir 2º servidor (D1): NÃO chamamos _coord.start().
-        # Seguro popular direto: o delegate só passa a ser usado após sou_coordenador
-        # = True, então não há acesso concorrente ainda (dispensa _state_lock).
+        # Semeia o estado sem subir um segundo servidor (não chama _coord.start()).
         self._coord._objects = {o["id"]: o for o in objetos}
         self._coord._members = list(membros)
 
-        # Registra/ATUALIZA o endereço do quadro no SN apontando para MIM.
-        # Na vitória de eleição/handoff, isto reaponta o quadro (enunciado §4).
+        # Registra ou reaponta o quadro no Serviço de Nomes para o meu endereço.
         self.send(self.ns_host, self.ns_port,
                   protocol.make_register(self.board_name, self.host, self.port))
 
@@ -532,11 +377,10 @@ class Client(Node):
         with self._estado_lock:
             self.membros = list(membros)
 
-        # Evita que o HB continue tratando o coordenador antigo como alvo.
+        # Evita que o heartbeat siga mirando o coordenador antigo.
         self.heartbeat.atualizar_coordenador(self.host, self.port)
 
-        # Sincroniza o anel: atualiza o meu HB e avisa os OUTROS membros do novo
-        # anel/coordenador (essencial após eleição/handoff; no-op na criação).
+        # Atualiza o meu anel e avisa os demais membros do novo coordenador.
         anel = construir_anel(list(membros), self.host, self.port)
         self.heartbeat.atualizar_anel(anel)
         ring_msg = protocol.make_ring_update(anel)
@@ -552,27 +396,20 @@ class Client(Node):
     # ==================================================================
 
     def _setup_heartbeat(self, anel: list):
-        """
-        Liga os callbacks e inicia o heartbeat. `iniciar` é idempotente
-        (heartbeat.py:97): chamar de novo num nó que já monitora não reinicia —
-        por isso na eleição/handoff basta atualizar_coordenador, sem re-setup.
-        """
+        """Liga os callbacks e inicia o heartbeat (iniciar() é idempotente)."""
         self.heartbeat.on_membro_falhou      = self._on_membro_falhou
         self.heartbeat.on_coordenador_falhou = self._on_coordenador_falhou
         self.heartbeat.iniciar(self.send, anel, self.coord_ip, self.coord_port)
 
     def _setup_election(self, membros: list):
-        """Liga os callbacks e injeta dependências da eleição (election.py:57)."""
+        """Liga os callbacks e injeta as dependências da eleição."""
         self.eleicao.on_tornou_coordenador = self._on_tornou_coordenador
         self.eleicao.on_novo_coordenador   = self._on_novo_coordenador
         self.eleicao.configurar(self.send, membros)
 
-    # ── Callbacks do Heartbeat ─────────────────────────────────────────
+    # Callbacks do heartbeat
     def _on_membro_falhou(self, ip: str, port: int):
-        """
-        Meu vizinho no anel (um membro comum) caiu. Quem trata a remoção é sempre
-        o coordenador — ele libera as travas do morto e faz broadcast do novo anel.
-        """
+        """Um membro comum caiu. Quem remove é sempre o coordenador."""
         if self.sou_coordenador:
             self._coord.remover_membro(ip, port)
             self._sincronizar_membros_do_coord()
@@ -581,10 +418,7 @@ class Client(Node):
                                    protocol.make_leave(f"{ip}:{port}"))
 
     def _on_coordenador_falhou(self):
-        """
-        Meu vizinho era o coordenador e caiu → disparar eleição (Bully). Atualizo a
-        lista de candidatos removendo o coordenador morto antes de iniciar.
-        """
+        """O coordenador caiu: dispara a eleição, tirando-o antes da lista de candidatos."""
         coord_id = f"{self.coord_ip}:{self.coord_port}"
         with self._estado_lock:
             vivos = [m for m in self.membros
@@ -592,21 +426,13 @@ class Client(Node):
         self.eleicao.atualizar_membros(vivos)
         self.eleicao.iniciar()
 
-    # ── Callbacks da Election ──────────────────────────────────────────
+    # Callbacks da eleição
     def _on_tornou_coordenador(self):
-        """
-        Venci a eleição. Assumo com a réplica local (objetos que recebi por broadcast
-        + membros vivos, sem o coordenador morto). _virar_coordenador reaponta o SN e
-        sincroniza o anel de todos.
-        """
+        """Venci a eleição: assumo com a réplica local de objetos e membros."""
         self._virar_coordenador(*self._estado_para_promocao())
 
     def _on_novo_coordenador(self, ip: str, port: int):
-        """
-        Recebi COORDINATOR. Dois casos:
-          - aponta para MIM (handoff: fui o sucessor escolhido) → assumo.
-          - aponta para outro nó (eleição/handoff normal) → atualizo minha referência.
-        """
+        """Recebi COORDINATOR. Se aponta para mim, assumo; senão, atualizo a referência."""
         if ip == self.host and port == self.port:
             self._virar_coordenador(*self._estado_para_promocao())
             return
@@ -618,10 +444,8 @@ class Client(Node):
         self._ui(self.on_coord_changed, ip, port, False)
 
     def _estado_para_promocao(self):
-        """
-        Snapshot (objetos, membros) para virar coordenador, removendo o coordenador
-        antigo e garantindo que EU esteja na lista. Usado por eleição e handoff.
-        """
+        """Snapshot (objetos, membros) para assumir: tira o coordenador antigo e
+        garante que eu esteja na lista."""
         coord_id_antigo = f"{self.coord_ip}:{self.coord_port}"
         with self._estado_lock:
             objetos = list(self.objetos.values())
@@ -637,16 +461,8 @@ class Client(Node):
     # ==================================================================
 
     def _ui(self, fn, *args):
-        """
-        Agenda `fn(*args)` para rodar na thread da GUI (D4).
-
-        handle_message roda numa thread de conexão do Node (node.py:86) e o tkinter
-        NÃO é thread-safe — nem `master.after()` pode ser chamado de outra thread
-        ("main thread is not in main loop"). Por isso apenas ENFILEIRAMOS aqui; a
-        thread do tkinter consome via drenar_ui() num poller periódico.
-
-        Sem `master` (testes sem GUI) chamamos direto. `fn` None é ignorado.
-        """
+        """Enfileira fn(*args) para a thread da interface consumir em drenar_ui(),
+        já que o tkinter não é seguro fora dela. Sem master (testes), chama direto."""
         if fn is None:
             return
         if self.master is not None:
@@ -655,10 +471,7 @@ class Client(Node):
             fn(*args)
 
     def drenar_ui(self):
-        """
-        Executa todos os callbacks de GUI pendentes. DEVE ser chamado pela thread
-        do tkinter (a App agenda um poller periódico com self.after()).
-        """
+        """Executa os callbacks pendentes. Chamado pela thread da interface."""
         while True:
             try:
                 fn, args = self._ui_queue.get_nowait()
@@ -670,33 +483,14 @@ class Client(Node):
                 print(f"[client] erro em callback de GUI: {e}")
 
     def _sincronizar_membros_do_coord(self):
-        """
-        Quando sou coordenador, mantém self.membros/anel/Election coerentes com o
-        delegate (fonte da verdade dos membros). Chamar após JOIN/LEAVE delegados.
-
-        O Coordinator já avisa os OUTROS via RING_UPDATE (coordinator.py:220), mas
-        o próprio nó coordenador precisa atualizar seu HB/eleição localmente.
-        """
+        """Sendo coordenador, alinha membros, anel e eleição locais ao estado do
+        motor. Chamado após JOIN ou LEAVE."""
         if not self.sou_coordenador or self._coord is None:
             return
-        estado = self._coord.get_state()           # coordinator.py:240
+        estado = self._coord.get_state()
         with self._estado_lock:
             self.membros = list(estado["members"])
             membros = list(self.membros)
-        anel = construir_anel(membros, self.host, self.port)   # heartbeat.py:39
+        anel = construir_anel(membros, self.host, self.port)
         self.heartbeat.atualizar_anel(anel)
         self.eleicao.atualizar_membros(membros)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NOTA sobre alterações de infra exigidas pelo Design B
-# ─────────────────────────────────────────────────────────────────────────────
-# O Design B (coordenador = um dos clientes, no mesmo processo/porta) exigiu DUAS
-# alterações pequenas em coordinator.py:
-#   1. [FEITA] _broadcast nunca envia para o próprio endereço — como o nó
-#      coordenador também está em _members, enviar a si mesmo causaria
-#      reprocessamento em loop. Correção universalmente válida.
-#   2. [OPCIONAL] expor seed(objects, members) público para o Client semear o
-#      estado sem subir 2º servidor, evitando tocar _objects/_members "privados".
-# Fora isso, o restante da infra (node, heartbeat, election, protocol,
-# name_service) permanece CONGELADO.

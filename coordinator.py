@@ -1,25 +1,10 @@
 """
-coordinator.py — Coordenador do Quadro SDWB
-Responsabilidades:
-  - Registrar o quadro no Serviço de Nomes ao iniciar
-  - Aceitar novos clientes (JOIN) e enviar o estado atual do quadro
-  - Receber operações (DRAW, REMOVE, COLOR) e repassar a todos os outros membros
-  - Gerenciar travas de objetos (exclusão mútua)
-  - Tratar saída voluntária de clientes (LEAVE)
-  - Expor remover_membro() para o heartbeat chamar quando detectar falha
-  - Expor get_state() para a eleição transferir estado ao novo coordenador
+coordinator.py: Coordenador de um quadro.
 
-Uso direto (criar quadro novo):
-    coord = Coordinator("MeuQuadro", "192.168.1.5", 6000, "192.168.1.1", 5000)
-    coord.start()
-
-Uso pós-eleição (cliente que venceu vira coordenador):
-    state = ...  # recebido durante a eleição
-    coord = Coordinator("MeuQuadro", meu_ip, minha_porta, ns_ip, ns_porta)
-    coord.start(
-        initial_objects=state["objects"],
-        initial_members=state["members"]
-    )
+Mantém os objetos, os membros e as travas de exclusão mútua. Registra o quadro
+no Serviço de Nomes, atende o ingresso (JOIN) enviando o estado atual, processa
+DRAW/REMOVE/COLOR retransmitindo aos demais e trata a saída de membros. Expõe
+remover_membro() para o heartbeat e get_state() para a eleição.
 """
 
 import threading
@@ -42,14 +27,10 @@ class Coordinator(Node):
         self.ns_host    = ns_host
         self.ns_port    = ns_port
 
-        # --- Estado compartilhado entre threads ---
-        # Objetos do quadro: { object_id: {id, shape, points, color} }
-        self._objects: dict = {}
-        # Membros conectados: [{"ip": str, "port": int}]
-        self._members: list = []
-        # Travas de exclusão mútua: { object_id: "ip:porta" }
-        self._locks: dict   = {}
-        # Lock único para proteger todo o estado acima
+        # Estado do quadro, protegido por _state_lock.
+        self._objects: dict = {}   # { object_id: {id, shape, points, color} }
+        self._members: list = []   # [{"ip": str, "port": int}]
+        self._locks: dict   = {}   # { object_id: "ip:porta" do dono }
         self._state_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -57,12 +38,8 @@ class Coordinator(Node):
     # ------------------------------------------------------------------
 
     def start(self, initial_objects: list = None, initial_members: list = None):
-        """
-        Inicia o coordenador:
-          1. Carrega estado inicial (se houver — caso pós-eleição)
-          2. Sobe o servidor TCP
-          3. Registra no Serviço de Nomes
-        """
+        """Carrega o estado inicial (quando vem de uma eleição), sobe o servidor
+        e registra o quadro no Serviço de Nomes."""
         if initial_objects:
             self._objects = {o["id"]: o for o in initial_objects}
         if initial_members:
@@ -106,7 +83,7 @@ class Coordinator(Node):
         return protocol.make_error(f"tipo desconhecido: {tipo}")
 
     # ------------------------------------------------------------------
-    # Onboarding — novo cliente entra no quadro
+    # Onboarding: novo cliente entra no quadro
     # ------------------------------------------------------------------
 
     def _tratar_join(self, msg: dict):
@@ -130,7 +107,7 @@ class Coordinator(Node):
         return protocol.make_state(snapshot_objetos, snapshot_membros)
 
     # ------------------------------------------------------------------
-    # Operações do quadro — atualiza estado e repassa aos outros
+    # Operações do quadro: atualiza estado e repassa aos outros
     # ------------------------------------------------------------------
 
     def _tratar_draw(self, msg: dict):
@@ -174,7 +151,7 @@ class Coordinator(Node):
         return protocol.make_ok()
 
     # ------------------------------------------------------------------
-    # Exclusão mútua — travas de objetos
+    # Exclusão mútua: travas de objetos
     # ------------------------------------------------------------------
 
     def _tratar_lock_request(self, msg: dict):
@@ -183,7 +160,7 @@ class Coordinator(Node):
 
         with self._state_lock:
             if oid not in self._locks:
-                # Objeto livre — concede a trava
+                # Objeto livre: concede a trava
                 self._locks[oid] = node_id
                 print(f"[COORD] LOCK concedido: '{oid}' -> {node_id}")
                 return protocol.make_lock_response(oid, granted=True)
@@ -214,7 +191,7 @@ class Coordinator(Node):
         return protocol.make_ok()
 
     def _tratar_heartbeat(self, msg: dict):
-        """Responde ao ping do vizinho no anel — mantém o coordenador vivo no anel."""
+        """Responde ao ping do vizinho, mantendo o coordenador vivo no anel."""
         return protocol.make_heartbeat_ok(self.node_id)
 
     def _broadcast_ring_update(self, todos_membros: list, destinatarios: list):
@@ -238,11 +215,7 @@ class Coordinator(Node):
         self._remover_membro_interno(ip, port, motivo="falha detectada pelo heartbeat")
 
     def get_state(self) -> dict:
-        """
-        Retorna snapshot do estado atual do quadro.
-        Usado pela eleição para transferir estado ao novo coordenador.
-        Retorna: {"objects": [...], "members": [...]}
-        """
+        """Snapshot do estado: {"objects": [...], "members": [...]}."""
         with self._state_lock:
             return {
                 "objects": list(self._objects.values()),
@@ -301,11 +274,8 @@ class Coordinator(Node):
         return [m for m in self._members if not (m["ip"] == ip and m["port"] == porta)]
 
     def _broadcast(self, msg: dict, membros: list):
-        """
-        Envia msg para todos os membros em paralelo. Fire-and-forget.
-        Nunca envia para o PRÓPRIO endereço: no Design B o nó coordenador também
-        está em _members, e enviar a si mesmo causaria reprocessamento em loop.
-        """
+        """Envia a msg a todos os membros em paralelo. Nunca envia para o próprio
+        endereço: o nó coordenador também está em _members e reprocessaria em loop."""
         def _enviar(m):
             if m["ip"] == self.host and m["port"] == self.port:
                 return

@@ -1,8 +1,6 @@
 """
-node.py — Classe base para todos os processos do SDWB
-Todo processo (Coordenador, Cliente) herda desta classe.
-Ela cuida de toda a mecânica de socket TCP — subclasses só precisam
-implementar handle_message() para definir o que fazer com cada mensagem.
+node.py: classe base de rede. Coordenador e Cliente herdam daqui.
+Cuida do servidor TCP e do envio; a subclasse implementa handle_message().
 """
 
 import socket
@@ -11,28 +9,12 @@ import protocol
 
 
 class Node:
-    """
-    Cada instância abre um servidor TCP numa porta própria e
-    consegue enviar mensagens para qualquer outro nó do sistema.
-
-    Uso básico (subclasse):
-
-        class MeuProcesso(Node):
-            def handle_message(self, msg, addr):
-                if msg["type"] == protocol.PING:
-                    return protocol.make_ok()
-                return protocol.make_error("desconhecido")
-
-        p = MeuProcesso("0.0.0.0", 6001)
-        p.start_server()
-        # ... lógica principal ...
-        p.stop()
-    """
+    """Servidor TCP em uma porta própria, com envio para outros nós."""
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.node_id = f"{host}:{port}"   # identificador único usado no heartbeat e eleição
+        self.node_id = f"{host}:{port}"   # identidade usada no heartbeat e na eleição
 
         self._server_socket = None
         self._running = False
@@ -53,7 +35,7 @@ class Node:
             raise RuntimeError(f"[{self.node_id}] Não foi possível abrir porta {self.port}: {e}")
 
         self._server_socket.listen()
-        # Timeout no accept() para que o loop consiga checar _running periodicamente
+        # accept() com timeout para o loop reavaliar _running periodicamente
         self._server_socket.settimeout(1.0)
 
         self._running = True
@@ -77,7 +59,7 @@ class Node:
                 )
                 t.start()
             except socket.timeout:
-                # Timeout normal — volta para checar _running
+                # Timeout normal: volta para checar _running
                 continue
             except OSError:
                 # Socket foi fechado por stop()
@@ -105,12 +87,8 @@ class Node:
             conn.close()
 
     def handle_message(self, msg: dict, addr: tuple):
-        """
-        Trata uma mensagem recebida. Deve ser sobrescrito pelas subclasses.
-
-        Retorne um dict para enviar como resposta.
-        Retorne None se não há resposta (ex: mensagem de broadcast que não precisa de ACK).
-        """
+        """Trata uma mensagem. Sobrescrito pelas subclasses. Retorna o dict de
+        resposta, ou None quando não há resposta a enviar."""
         print(f"[{self.node_id}] Mensagem sem handler: {msg.get('type')}")
         return protocol.make_error(f"tipo não reconhecido: {msg.get('type')}")
 
@@ -125,18 +103,12 @@ class Node:
         print(f"[{self.node_id}] Servidor encerrado.")
 
     # ------------------------------------------------------------------
-    # Cliente TCP — envio de mensagens para outros nós
+    # Cliente TCP: envio de mensagens para outros nós
     # ------------------------------------------------------------------
 
     def send(self, ip: str, port: int, msg: dict, timeout: int = 5):
-        """
-        Envia uma mensagem para outro nó e aguarda resposta.
-
-        Retorna o dict de resposta, ou None se a conexão falhar
-        (nó está fora do ar, timeout, recusa de conexão, etc.).
-
-        O chamador deve sempre checar se o retorno é None antes de usar.
-        """
+        """Envia e aguarda resposta. Retorna o dict recebido, ou None em falha
+        de conexão (nó fora do ar, timeout, recusa). Sempre checar None."""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
@@ -159,10 +131,7 @@ class Node:
                 pass
 
     def send_sem_resposta(self, ip: str, port: int, msg: dict, timeout: int = 5):
-        """
-        Envia uma mensagem sem esperar resposta (fire-and-forget).
-        Útil para broadcasts onde a resposta não importa.
-        """
+        """Envia sem esperar resposta. Usado nas retransmissões."""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:

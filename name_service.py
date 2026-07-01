@@ -1,7 +1,6 @@
 """
-name_service.py — Serviço de Nomes do SDWB
-Processo separado com IP e porta FIXOS — o único do sistema.
-Mantém a tabela: { nome_do_quadro -> (ip, porta) }
+name_service.py: Serviço de Nomes. Processo separado, com IP e porta fixos.
+Mantém a tabela { nome_do_quadro -> (ip, porta) } e atende REGISTER/UNREGISTER/LIST.
 
 Uso:
     python name_service.py
@@ -14,7 +13,7 @@ import argparse
 import protocol
 
 # ---------------------------------------------------------------------------
-# Configuração — único endereço fixo do sistema
+# Configuração: único endereço fixo do sistema
 # ---------------------------------------------------------------------------
 HOST_PADRAO = '0.0.0.0'
 PORTA_PADRAO = 5000
@@ -28,13 +27,9 @@ _lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Poda de quadros órfãos (verificação de vivacidade no LIST)
+# Poda de quadros órfãos: antes de responder o LIST, verifica cada coordenador
+# e remove da tabela os que não respondem (coordenador encerrado sem aviso).
 # ---------------------------------------------------------------------------
-# O SN não é avisado quando um coordenador CRASHA (kill -9) nem quando um handoff
-# de saída falha: a entrada ficaria na tabela apontando para um nó morto — aparece
-# no LIST, mas o JOIN falha ("coordenador não disponível"). Para evitar esses
-# quadros "fantasma", antes de responder o LIST o SN faz um probe rápido em cada
-# coordenador (conecta + HEARTBEAT) e remove da tabela os que não respondem.
 
 def _coordenador_vivo(ip: str, port: int, timeout: float = 1.0) -> bool:
     """True se o coordenador em ip:port responde a um HEARTBEAT dentro do timeout."""
@@ -55,11 +50,8 @@ def _coordenador_vivo(ip: str, port: int, timeout: float = 1.0) -> bool:
 
 
 def _separar_vivos_e_mortos(itens: list):
-    """
-    Faz probe EM PARALELO de cada (nome, {ip, port}) — para não somar timeouts —
-    e separa vivos de mortos.
-    Retorna (vivos: [(nome, dados)], mortos: [(nome, ip, port)]).
-    """
+    """Verifica os coordenadores em paralelo (para não somar timeouts).
+    Retorna (vivos: [(nome, dados)], mortos: [(nome, ip, port)])."""
     resultado = {}
 
     def _probe(nome, ip, port):
@@ -84,7 +76,7 @@ def _separar_vivos_e_mortos(itens: list):
 # ---------------------------------------------------------------------------
 
 def _tratar_cliente(conn: socket.socket, addr: tuple):
-    """Trata uma única requisição recebida. Cada conexão = uma mensagem + resposta."""
+    """Trata uma requisição: uma mensagem, uma resposta, por conexão."""
     try:
         msg = protocol.decode(conn)
         if msg is None:
@@ -115,9 +107,8 @@ def _tratar_cliente(conn: socket.socket, addr: tuple):
             with _lock:
                 itens = list(_quadros.items())
             vivos, mortos = _separar_vivos_e_mortos(itens)
-            # Poda os órfãos — mas só apaga se a entrada ainda apontar para o mesmo
-            # endereço morto que foi sondado (evita remover um quadro que acabou de
-            # ser RE-registrado, ex.: novo coordenador após eleição).
+            # Só remove se a entrada ainda aponta para o endereço morto que foi
+            # sondado, para não apagar um quadro reapontado por uma eleição nesse meio.
             if mortos:
                 with _lock:
                     for nome, ip, port in mortos:

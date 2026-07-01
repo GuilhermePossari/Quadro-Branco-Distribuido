@@ -1,16 +1,15 @@
 """
-main.py — Ponto de entrada do cliente SDWB (GUI).
+main.py: ponto de entrada do cliente (interface gráfica).
 
 Uso:
     python main.py [porta] [ip_proprio] [--ns IP:PORTA]
 
-  porta       porta TCP deste nó (default 6001). Cada nó na mesma máquina usa uma.
-  ip_proprio  IP com que este nó se anuncia aos outros. Default: detectado
-              automaticamente (a interface de saída). NUNCA use 127.0.0.1 num
-              teste entre máquinas (Ubuntu↔WSL) — os outros nós não te alcançariam.
-  --ns        endereço do Serviço de Nomes (default 127.0.0.1:5000).
+  porta       porta TCP deste nó (padrão 6001); uma por nó na mesma máquina.
+  ip_proprio  IP anunciado aos outros. Se omitido, é detectado automaticamente.
+              Entre máquinas diferentes, não use 127.0.0.1.
+  --ns        endereço do Serviço de Nomes (padrão 127.0.0.1:5000).
 
-Antes de subir clientes, rode o Serviço de Nomes:  python name_service.py
+Suba o Serviço de Nomes antes dos clientes: python name_service.py
 """
 
 import sys
